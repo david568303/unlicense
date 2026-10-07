@@ -14,6 +14,11 @@ from .process_control import (ProcessController, Architecture, MemoryRange,
 LOG = logging.getLogger(__name__)
 # See issue #7: messages cannot exceed 128MiB
 MAX_DATA_CHUNK_SIZE = 64 * 1024 * 1024
+# Frida's exception classes don't share a public common base across all
+# versions, so enumerate the ones that can be raised while tearing down an
+# already-dead process or an already-destroyed/detached session.
+_TEARDOWN_ERRORS = (frida.InvalidOperationError, frida.ProcessNotFoundError,
+                    frida.TransportError, frida.core.RPCException)
 
 OepReachedCallback = Callable[[int, int, bool], None]
 
@@ -130,9 +135,27 @@ class FridaProcessController(ProcessController):
             raise WriteProcessMemoryError from rpc_exception
 
     def terminate_process(self) -> None:
-        self._frida_rpc.notify_dumping_finished()
-        frida.kill(self.pid)
-        self._frida_session.detach()
+        # Cleanup is best-effort: the script, process or session may already
+        # be gone (e.g. the target exited or crashed before the OEP was
+        # reached, which destroys the injected script). Each step is isolated
+        # so a failure in one doesn't skip the others or mask the original
+        # error that triggered this cleanup.
+        try:
+            self._frida_rpc.notify_dumping_finished()
+        except _TEARDOWN_ERRORS as frida_error:
+            LOG.debug("Failed to notify script (already destroyed?): %s",
+                      frida_error)
+
+        try:
+            frida.kill(self.pid)
+        except _TEARDOWN_ERRORS as frida_error:
+            LOG.debug("Failed to kill process (already dead?): %s",
+                      frida_error)
+
+        try:
+            self._frida_session.detach()
+        except _TEARDOWN_ERRORS as frida_error:
+            LOG.debug("Failed to detach session: %s", frida_error)
 
     def _frida_range_to_mem_range(self, dict_range: Dict[str, Any],
                                   with_data: bool) -> MemoryRange:
