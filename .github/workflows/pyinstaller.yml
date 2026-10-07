@@ -17,12 +17,12 @@ jobs:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python_version }}
           architecture: ${{ matrix.architecture }}
@@ -40,7 +40,7 @@ jobs:
         run: poetry run pyinstaller unlicense.spec
 
       - name: "Upload PyInstaller Artifact"
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: unlicense-py${{ matrix.python_version }}-${{ matrix.architecture }}
           path: dist/*.exe
