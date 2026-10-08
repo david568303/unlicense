@@ -368,35 +368,48 @@ rpc.exports = {
         });
 
         const state = {
-            active: null,
+            activeByThread: new Map(),
+            followedThreads: new Set(),
             resolutions: new Map(),
             wrappersByAddress: wrappersByAddress,
             returnsByAddress: returnsByAddress,
-            exportsByAddress: exportsByAddress
+            exportsByAddress: exportsByAddress,
+            pollTimer: null,
+            stats: {
+                compiledBlocks: 0,
+                exportHits: 0,
+                returnHits: 0,
+                wrapperHits: 0,
+                threadIds: []
+            }
         };
         wrapperTraceState = state;
 
-        function saveResolution(exportInfo) {
-            if (state.active === null || exportInfo === null) {
+        function saveResolution(threadId, exportInfo) {
+            const active = state.activeByThread.get(threadId);
+            if (active === undefined || exportInfo === null) {
                 return;
             }
             const result = {
-                callAddress: state.active.callAddress,
-                wrapperAddress: state.active.wrapperAddress,
+                callAddress: active.callAddress,
+                wrapperAddress: active.wrapperAddress,
                 address: exportInfo.address,
                 name: exportInfo.name,
-                module: exportInfo.module
+                module: exportInfo.module,
+                threadId: threadId
             };
             state.resolutions.set(result.callAddress, result);
-            state.active = null;
+            state.activeByThread.delete(threadId);
         }
 
-        Stalker.follow(oepThreadId, {
-            transform(iterator) {
+        function makeTraceOptions(threadId) {
+            return {
+              transform(iterator) {
                 let instruction = iterator.next();
                 if (instruction === null) {
                     return;
                 }
+                state.stats.compiledBlocks++;
 
                 const blockAddress = instruction.address.toString();
                 const wrapperCandidates = state.wrappersByAddress.get(blockAddress);
@@ -405,6 +418,7 @@ rpc.exports = {
 
                 if (wrapperCandidates !== undefined) {
                     iterator.putCallout(context => {
+                        state.stats.wrapperHits++;
                         let nativeReturn;
                         try {
                             nativeReturn = context.sp.readPointer();
@@ -417,22 +431,24 @@ rpc.exports = {
                         const selected = matching === undefined
                             ? wrapperCandidates[0]
                             : matching;
-                        state.active = Object.assign({}, selected, {
+                        state.activeByThread.set(threadId, Object.assign({}, selected, {
                             nativeReturn: nativeReturn,
                             lastExport: null
-                        });
+                        }));
                     });
                 }
 
                 if (exportInfo !== undefined) {
                     iterator.putCallout(context => {
-                        if (state.active === null) {
+                        state.stats.exportHits++;
+                        const active = state.activeByThread.get(threadId);
+                        if (active === undefined) {
                             return;
                         }
-                        state.active.lastExport = exportInfo;
+                        active.lastExport = exportInfo;
                         try {
-                            if (context.sp.readPointer().equals(state.active.nativeReturn)) {
-                                saveResolution(exportInfo);
+                            if (context.sp.readPointer().equals(active.nativeReturn)) {
+                                saveResolution(threadId, exportInfo);
                             }
                         }
                         catch (_error) {
@@ -443,8 +459,10 @@ rpc.exports = {
 
                 if (returnCandidates !== undefined) {
                     iterator.putCallout(_context => {
-                        if (state.active !== null) {
-                            saveResolution(state.active.lastExport);
+                        state.stats.returnHits++;
+                        const active = state.activeByThread.get(threadId);
+                        if (active !== undefined) {
+                            saveResolution(threadId, active.lastExport);
                         }
                     });
                 }
@@ -452,8 +470,30 @@ rpc.exports = {
                 do {
                     iterator.keep();
                 } while ((instruction = iterator.next()) !== null);
+              }
+            };
+        }
+
+        const agentThreadId = Process.getCurrentThreadId();
+        function followThread(threadId) {
+            if (threadId === agentThreadId || state.followedThreads.has(threadId)) {
+                return;
             }
-        });
+            try {
+                Stalker.follow(threadId, makeTraceOptions(threadId));
+                state.followedThreads.add(threadId);
+                state.stats.threadIds.push(threadId);
+            }
+            catch (_error) {
+                // Threads can exit between enumeration and Stalker.follow().
+            }
+        }
+
+        Process.enumerateThreads().forEach(thread => followThread(thread.id));
+        followThread(oepThreadId);
+        state.pollTimer = setInterval(() => {
+            Process.enumerateThreads().forEach(thread => followThread(thread.id));
+        }, 25);
 
         // The OEP was made non-executable only to detect it. Native tracing
         // now needs to let the original thread continue normally.
@@ -461,14 +501,25 @@ rpc.exports = {
     },
     collectWrapperTrace: function () {
         if (wrapperTraceState === null) {
-            return [];
+            return { results: [], stats: null };
         }
-        Stalker.unfollow(oepThreadId);
+        if (wrapperTraceState.pollTimer !== null) {
+            clearInterval(wrapperTraceState.pollTimer);
+        }
+        wrapperTraceState.followedThreads.forEach(threadId => {
+            try {
+                Stalker.unfollow(threadId);
+            }
+            catch (_error) {
+                // A followed thread may already have exited.
+            }
+        });
         Stalker.flush();
         const results = Array.from(wrapperTraceState.resolutions.values());
+        const stats = wrapperTraceState.stats;
         wrapperTraceState = null;
         setImmediate(() => Stalker.garbageCollect());
-        return results;
+        return { results: results, stats: stats };
     },
     getArchitecture: function () { return Process.arch; },
     getPointerSize: function () { return Process.pointerSize; },

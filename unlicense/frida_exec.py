@@ -82,7 +82,17 @@ class FridaProcessController(ProcessController):
         self._frida_rpc.setup_wrapper_trace(wrappers, self.main_module_name)
         self._frida_script.post({"type": "block_on_oep"})
         time.sleep(max(0, timeout_ms) / 1000.0)
-        value: List[Dict[str, Any]] = self._frida_rpc.collect_wrapper_trace()
+        trace_data: Dict[str, Any] = self._frida_rpc.collect_wrapper_trace()
+        value: List[Dict[str, Any]] = trace_data.get("results", [])
+        stats: Optional[Dict[str, Any]] = trace_data.get("stats")
+        if stats is not None:
+            LOG.info(
+                "Native trace stats: threads=%d blocks=%d wrapper_hits=%d "
+                "export_hits=%d return_hits=%d",
+                len(stats.get("threadIds",
+                              [])), stats.get("compiledBlocks", 0),
+                stats.get("wrapperHits", 0), stats.get("exportHits", 0),
+                stats.get("returnHits", 0))
         return {
             int(result["callAddress"], 16): int(result["address"], 16)
             for result in value
