@@ -10,6 +10,8 @@
 ### Fixed
 - Simulate Windows heap APIs while resolving import wrappers instead of
   executing the real heap implementation with an incomplete emulated PEB.
+- Bound wrapper emulation and keep synthetic heap allocation local to Unicorn
+  so a paused target cannot stall a nested Frida RPC indefinitely.
 - Avoid printing raw ANSI color sequences in the Windows 7 console.
 
 ## [0.4.0] - 2023-08-14

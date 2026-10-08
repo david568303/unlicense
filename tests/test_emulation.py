@@ -4,8 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest.mock import Mock, patch
 
-from unlicense.emulation import resolve_wrapped_api
+from unicorn import (  # type: ignore
+    Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_ERR_MAP)
+
+from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
 from unlicense.process_control import (Architecture, MemoryRange,
                                        ProcessController,
                                        ReadProcessMemoryError)
@@ -84,6 +88,37 @@ def _relative_branch(opcode: int, instruction_address: int,
 
 
 class HeapWrapperEmulationTests(unittest.TestCase):
+
+    def test_synthetic_heap_search_is_bounded(self) -> None:
+        controller = FakeProcessController({}, {})
+        unicorn_mock = Mock()
+        unicorn_mock.mem_map.side_effect = UcError(UC_ERR_MAP)
+        context: Dict[str, Any] = {
+            "process_controller": controller,
+            "heap_next": 0x30000000,
+            "heap_allocations": {},
+            "diagnostic": {},
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "bounded synthetic heap"):
+            _allocate_emulated_heap(unicorn_mock, 0x20, context)
+        self.assertIn("heap_error", context["diagnostic"])
+        self.assertEqual(256, unicorn_mock.mem_map.call_count)
+
+    def test_emulation_instruction_limit_returns_unresolved(self) -> None:
+        call_site = 0x401000
+        looping_page = bytearray(0x1000)
+        looping_page[0:2] = b"\xeb\xfe"
+        controller = FakeProcessController({call_site: bytes(looping_page)},
+                                           {})
+        diagnostic: Dict[str, Any] = {}
+
+        with patch("unlicense.emulation.MAX_EMULATION_INSTRUCTIONS", 100):
+            resolved = resolve_wrapped_api(call_site, controller, None,
+                                           diagnostic)
+
+        self.assertIsNone(resolved)
+        self.assertIn("stopped before reaching", diagnostic["error"])
 
     def test_rtl_allocate_heap_is_simulated_before_target_api(self) -> None:
         call_site = 0x401000

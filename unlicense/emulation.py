@@ -16,6 +16,9 @@ from .process_control import ProcessController, Architecture, ReadProcessMemoryE
 
 STACK_MAGIC_RET_ADDR = 0xdeadbeef
 MAX_EMULATED_HEAP_ALLOCATION = 64 * 1024 * 1024
+MAX_HEAP_MAPPING_ATTEMPTS = 256
+MAX_EMULATION_INSTRUCTIONS = 2_000_000
+EMULATION_TIMEOUT_MICROSECONDS = 5_000_000
 LOG = logging.getLogger(__name__)
 
 
@@ -31,7 +34,6 @@ def resolve_wrapped_api(
         pc_register = UC_X86_REG_EIP
         sp_register = UC_X86_REG_ESP
         bp_register = UC_X86_REG_EBP
-        result_register = UC_X86_REG_EAX
         stack_addr = 0xff000000
         setup_teb = _setup_teb_x86
     elif arch == Architecture.X86_64:
@@ -40,7 +42,6 @@ def resolve_wrapped_api(
         pc_register = UC_X86_REG_RIP
         sp_register = UC_X86_REG_RSP
         bp_register = UC_X86_REG_RBP
-        result_register = UC_X86_REG_RAX
         stack_addr = 0xff00000000000000
         setup_teb = _setup_teb_x64
     else:
@@ -83,13 +84,14 @@ def resolve_wrapped_api(
             stop_on_ret_addr = STACK_MAGIC_RET_ADDR
         else:
             stop_on_ret_addr = expected_ret_addr
-        emulation_context = {
+        emulation_context: Dict[str, Any] = {
             "process_controller": process_controller,
             "stop_on_ret_addr": stop_on_ret_addr,
             "diagnostic": diagnostic,
             "heap_next":
             0x30000000 if arch == Architecture.X86_32 else 0x20000000000,
             "heap_allocations": {},
+            "resolved_address": None,
         }
         uc.hook_add(UC_HOOK_MEM_UNMAPPED,
                     _unicorn_hook_unmapped,
@@ -98,15 +100,26 @@ def resolve_wrapped_api(
                     _unicorn_hook_block,
                     user_data=emulation_context)
 
-        uc.emu_start(wrapper_start_addr, wrapper_start_addr + 1024)
+        uc.emu_start(wrapper_start_addr,
+                     wrapper_start_addr + 1024,
+                     timeout=EMULATION_TIMEOUT_MICROSECONDS,
+                     count=MAX_EMULATION_INSTRUCTIONS)
 
-        # Read and return PC
-        pc = uc.reg_read(result_register)
-        assert isinstance(pc, int)
-        diagnostic["resolved_address"] = hex(pc)
+        resolved_address = emulation_context["resolved_address"]
+        if resolved_address is None:
+            pc = uc.reg_read(pc_register)
+            assert isinstance(pc, int)
+            diagnostic.update({
+                "error": "Emulation stopped before reaching a final API",
+                "pc": hex(pc),
+            })
+            LOG.debug("Emulation limit reached before resolving the wrapper")
+            return None
 
-        return pc
-    except UcError as e:
+        assert isinstance(resolved_address, int)
+        diagnostic["resolved_address"] = hex(resolved_address)
+        return resolved_address
+    except (UcError, RuntimeError) as e:
         LOG.debug("ERROR: %s", str(e))
         pc = uc.reg_read(pc_register)
         assert isinstance(pc, int)
@@ -230,12 +243,14 @@ def _unicorn_hook_block(uc: Uc, address: int, _size: int,
                 or ret_addr == STACK_MAGIC_RET_ADDR:
             # Most wrappers should end up here directly
             uc.reg_write(result_register, address)
+            emulation_context["resolved_address"] = address
             uc.emu_stop()
             return
         if _is_no_return_api(api_name):
             # Note: Dirty fix for ExitProcess-like wrappers on WinLicense 3.x
             LOG.debug("Reached noreturn API, stopping emulation")
             uc.reg_write(result_register, address)
+            emulation_context["resolved_address"] = address
             uc.emu_stop()
             return
         if _is_simulated_api(api_name):
@@ -368,17 +383,29 @@ def _allocate_emulated_heap(uc: Uc, requested_size: int,
     mapped_size = ((allocation_size + page_size - 1) // page_size) * page_size
     candidate = emulation_context["heap_next"]
     candidate -= candidate % page_size
+    max_address = (0xe0000000 if process_controller.architecture
+                   == Architecture.X86_32 else 0x00007f0000000000)
+    LOG.debug("Allocating synthetic heap block: requested=%s mapped=%s",
+              hex(requested_size), hex(mapped_size))
 
-    # Avoid ranges from the real process and previous synthetic allocations.
-    while True:
-        if process_controller.find_range_by_address(candidate) is not None:
-            candidate += mapped_size + page_size
-            continue
+    # Only inspect Unicorn's local map here. Calling back into Frida from a
+    # Unicorn hook can deadlock while the instrumented process is paused.
+    for _attempt in range(MAX_HEAP_MAPPING_ATTEMPTS):
+        if candidate + mapped_size >= max_address:
+            break
         try:
             uc.mem_map(candidate, mapped_size, UC_PROT_READ | UC_PROT_WRITE)
             break
         except UcError:
             candidate += mapped_size + page_size
+    else:
+        candidate = max_address
+
+    if candidate + mapped_size >= max_address:
+        error = ("Unable to reserve a bounded synthetic heap range "
+                 f"for {hex(mapped_size)} bytes")
+        emulation_context["diagnostic"]["heap_error"] = error
+        raise RuntimeError(error)
 
     emulation_context["heap_next"] = candidate + mapped_size + page_size
     emulation_context["heap_allocations"][candidate] = allocation_size
