@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Add a reproducible CPython 3.8 build path for Windows 7 legacy targets.
+
 ## [0.4.0] - 2023-08-14
 ### Added
 - Add a `--no_imports` option that allows dumping PEs at the original entry point without fixing imports

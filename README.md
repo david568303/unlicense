@@ -10,6 +10,41 @@ tool in a VM if you're unsure about what the target executable does.
 
 Note: You need to use a 32-bit Python interpreter to dump 32-bit executables.
 
+### Windows 7 legacy targets
+
+The existing published release build uses Python 3.9 or newer and therefore
+cannot run on Windows 7.  For a target that only runs on Windows 7, build
+Unlicense with **CPython 3.8.10**, the final CPython release with Windows 7
+support:
+
+```powershell
+# Build x64 Unlicense with a 64-bit Python 3.8 interpreter.
+powershell -ExecutionPolicy Bypass -File .\scripts\build_win7.ps1 `
+  -PythonPath C:\Python38-x64\python.exe
+
+# Build x86 Unlicense separately with a 32-bit Python 3.8 interpreter.
+powershell -ExecutionPolicy Bypass -File .\scripts\build_win7.ps1 `
+  -PythonPath C:\Python38-x86\python.exe
+```
+
+Run the matching build and the protected target together inside the same
+Windows 7 SP1 guest (or an isolated Windows 7 test machine):
+
+```powershell
+.\unlicense-win7-x86.exe .\protected-x86.exe --verbose=true --timeout=60
+```
+
+Unlicense is not a remote dumper: Frida starts the target locally and Scylla
+opens that local process ID.  Consequently, running Unlicense on Windows 10/11
+while the target runs in a Windows 7 VM will not work without replacing the
+Scylla dumping backend.  If the protected target detects virtual machines, use
+an isolated physical/dual-boot Windows 7 system instead.  Take a snapshot (when
+using a VM) and disconnect unneeded network access before executing a target.
+
+The guest should have Windows 7 SP1, the Universal CRT update (KB2999226), and a
+Windows 7-compatible Visual C++ runtime, such as the 14.29.x redistributable.
+The Unlicense build architecture must match the target architecture.
+
 ## Features
 
 * Handles Themida/Winlicense 2.x and 3.x
