@@ -54,6 +54,7 @@ def run_unlicense(
     active_wrapper_probe: bool = False,
     active_probe_timeout: int = 5000,
     active_probe_startup_retries: int = 2,
+    output_directory: Optional[str] = None,
 ) -> None:
     """
     Unpack executables protected with Themida/WinLicense 2.x and 3.x
@@ -81,6 +82,22 @@ def run_unlicense(
     if not pe_path.is_file():
         LOG.error("'%s' isn't a file or doesn't exist", pe_path)
         sys.exit(1)
+
+    output_file_path: Optional[str] = None
+    if output_directory is not None:
+        output_root = Path(output_directory).resolve()
+        output_path = output_root / pe_path.name
+        if output_path == pe_path.resolve():
+            LOG.error("The identity-preserving output must not overwrite the "
+                      "protected input. Choose a separate directory.")
+            sys.exit(1)
+        if output_path.exists():
+            LOG.error("Identity-preserving output '%s' already exists; move "
+                      "or remove it before retrying", output_path)
+            sys.exit(1)
+        output_root.mkdir(parents=True, exist_ok=True)
+        output_file_path = str(output_path)
+        LOG.info("Identity-preserving output enabled: '%s'", output_path)
 
     # Detect Themida/Winlicense version if needed
     if target_version is None:
@@ -130,12 +147,14 @@ def run_unlicense(
         # .NET assembly dumping works the same way regardless of the version
         if is_dotnet:
             LOG.info("Dumping .NET assembly ...")
-            if not dump_dotnet_assembly(process_controller, dumped_image_base):
+            if not dump_dotnet_assembly(process_controller, dumped_image_base,
+                                        output_file_path):
                 LOG.error(".NET assembly dump failed")
         # Do not bother recovering imports and start dumping if requested
         elif no_imports:
             dump_pe(process_controller, pe_to_dump, dumped_image_base,
-                    dumped_oep, 0, 0, True)
+                    dumped_oep, 0, 0, True,
+                    output_file_path=output_file_path)
         # Fix imports and dump the executable
         elif target_version == 2:
             assert text_section_ranges is not None
@@ -153,14 +172,16 @@ def run_unlicense(
                 text_section_range, diagnostic_output, native_trace_timeout,
                 active_wrapper_probe, active_probe_timeout,
                 create_probe_process if active_wrapper_probe else None,
-                image_section_ranges=section_ranges)
+                image_section_ranges=section_ranges,
+                output_file_path=output_file_path)
         elif target_version == 3:
             if diagnostic_output is not None:
                 LOG.warning(
                     "Diagnostic reports currently cover Themida 2.x only")
             winlicense3.fix_and_dump_pe(process_controller, pe_to_dump,
                                         dumped_image_base, dumped_oep,
-                                        section_ranges, text_section_range)
+                                        section_ranges, text_section_range,
+                                        output_file_path)
     finally:
         # Try to kill the process on exit
         process_controller.terminate_process()

@@ -132,6 +132,7 @@ def fix_and_dump_pe(
                                              Tuple[Optional[ProcessController],
                                                    Optional[int]]]] = None,
     image_section_ranges: Optional[List[MemoryRange]] = None,
+    output_file_path: Optional[str] = None,
 ) -> None:
     """
     Main dumping routine for Themida/WinLicense 2.x.
@@ -258,7 +259,8 @@ def fix_and_dump_pe(
                                   for call_sites in api_to_calls.values()
                                   for call_address, _, _ in call_sites]
         dump_pe(process_controller, pe_file_path, image_base, oep, iat_addr,
-                iat_size, True, pristine_ranges, preserved_patch_ranges)
+                iat_size, True, pristine_ranges, preserved_patch_ranges,
+                output_file_path)
     except Exception as error:
         LOG.error(
             "Dump target became unavailable before PE reconstruction: "

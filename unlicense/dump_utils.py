@@ -284,6 +284,7 @@ def dump_pe(
     add_new_iat: bool,
     pristine_ranges: Optional[List[MemoryRange]] = None,
     preserved_patch_ranges: Optional[List[Tuple[int, int]]] = None,
+    output_file_path: Optional[str] = None,
 ) -> bool:
     # Reclaim as much memory as possible. This is kind of a hack for 32-bit
     # interpreters not to run out of memory when dumping.
@@ -364,7 +365,8 @@ def dump_pe(
             return False
 
         LOG.info("Rebuilding PE ...")
-        output_file_name = f"unpacked_{process_controller.main_module_name}"
+        output_file_name = output_file_path or \
+            f"unpacked_{process_controller.main_module_name}"
         _fix_pe(TMP_FILE_PATH2, output_file_name, pe_file_path)
 
         validation = _validate_dump(
@@ -400,8 +402,10 @@ def dump_pe(
 def dump_dotnet_assembly(
     process_controller: ProcessController,
     image_base: int,
+    output_file_path: Optional[str] = None,
 ) -> bool:
-    output_file_name = f"unpacked_{process_controller.main_module_name}"
+    output_file_name = output_file_path or \
+        f"unpacked_{process_controller.main_module_name}"
     try:
         pyscylla.dump_pe(process_controller.pid, image_base, image_base,
                          output_file_name, None)

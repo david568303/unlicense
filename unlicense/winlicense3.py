@@ -16,7 +16,8 @@ IAT_MAX_SUCCESSIVE_FAILURES = 2
 def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
                     image_base: int, oep: int,
                     section_ranges: List[MemoryRange],
-                    text_section_range: MemoryRange) -> None:
+                    text_section_range: MemoryRange,
+                    output_file_path: Optional[str] = None) -> None:
     """
     Main dumping routine for Themida/WinLicense 3.x.
     """
@@ -41,7 +42,7 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
 
     LOG.info("Dumping PE with OEP=%s ...", hex(oep))
     dump_pe(process_controller, pe_file_path, image_base, oep, iat_addr,
-            iat_size, False)
+            iat_size, False, output_file_path=output_file_path)
 
 
 def _find_iat(process_controller: ProcessController, image_base: int,

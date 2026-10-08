@@ -382,6 +382,30 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual(["terminate", "rebuild"], events)
         self.assertEqual(1, controller.terminate_count)
 
+    def test_dump_can_preserve_original_executable_name_in_separate_dir(
+            self) -> None:
+        controller = FakeProcessController({}, {})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "runtime" / "Titanium.exe"
+            output.parent.mkdir()
+
+            def dump_to_file(_pid: int, _base: int, _oep: int, path: str,
+                             _original: str) -> None:
+                Path(path).write_bytes(b"memory image")
+
+            with patch("unlicense.dump_utils.pyscylla.dump_pe",
+                       side_effect=dump_to_file), patch(
+                           "unlicense.dump_utils.pyscylla.rebuild_pe"), patch(
+                               "unlicense.dump_utils._fix_pe") as fix_pe, patch(
+                                   "unlicense.dump_utils._validate_dump",
+                                   return_value={"valid": True, "issues": []}):
+                result = dump_pe(controller, "protected/Titanium.exe",
+                                 0x400000, 0xd54c3f, 0, 0, True,
+                                 output_file_path=str(output))
+
+            self.assertTrue(result)
+            self.assertEqual(str(output), fix_pe.call_args.args[1])
+
     def test_zero_iat_preserves_unmodified_memory_dump(self) -> None:
         controller = FakeProcessController({}, {})
         with tempfile.TemporaryDirectory() as directory:

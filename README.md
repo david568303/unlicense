@@ -35,6 +35,24 @@ Windows 7 SP1 guest (or an isolated Windows 7 test machine):
   --diagnostic_output=unlicense-diagnostics.json
 ```
 
+Some licensed applications include the executable name in their runtime
+identity checks. To test such a target without overwriting the protected
+input, write the dump into a separate runtime directory while preserving its
+original filename:
+
+```powershell
+.\unlicense-win7-x86.exe C:\protected\Titanium.exe --verbose=true `
+  --timeout=60 --native_trace_timeout=60000 `
+  --active_wrapper_probe=false `
+  --diagnostic_output=Titanium-diagnostics.json `
+  --output_directory=C:\runtime-copy
+```
+
+This produces `C:\runtime-copy\Titanium.exe`. Populate that directory with
+the target's normal DLLs, license files, and data before running the result.
+Unlicense refuses to overwrite either the protected input or an existing file
+at the identity-preserving output path.
+
 The optional diagnostic report contains PE metadata, loaded-module names,
 small byte windows around detected import wrappers, and emulation failures. It
 does not contain the complete protected or unpacked executable. Themida 2.x
