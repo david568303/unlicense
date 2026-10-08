@@ -14,13 +14,17 @@ from .dump_utils import pointer_size_to_fmt
 from .process_control import ProcessController, Architecture, ReadProcessMemoryError
 
 STACK_MAGIC_RET_ADDR = 0xdeadbeef
+# Upper bound on the number of instructions emulated per wrapper when the
+# "map missing memory as zero" fallback is enabled. Without a cap, a wrapper
+# that loops over zero-filled memory could run forever.
+MAX_EMULATED_INSTRUCTIONS = 2_000_000
 LOG = logging.getLogger(__name__)
 
 
-def resolve_wrapped_api(
-        wrapper_start_addr: int,
-        process_controller: ProcessController,
-        expected_ret_addr: Optional[int] = None) -> Optional[int]:
+def resolve_wrapped_api(wrapper_start_addr: int,
+                        process_controller: ProcessController,
+                        expected_ret_addr: Optional[int] = None,
+                        map_missing_as_zero: bool = False) -> Optional[int]:
     arch = process_controller.architecture
     if arch == Architecture.X86_32:
         uc_arch = UC_ARCH_X86
@@ -71,16 +75,33 @@ def resolve_wrapped_api(
             stop_on_ret_addr = expected_ret_addr
         uc.hook_add(UC_HOOK_MEM_UNMAPPED,
                     _unicorn_hook_unmapped,
-                    user_data=process_controller)
+                    user_data=(process_controller, map_missing_as_zero))
         uc.hook_add(UC_HOOK_BLOCK,
                     _unicorn_hook_block,
                     user_data=(process_controller, stop_on_ret_addr))
 
-        uc.emu_start(wrapper_start_addr, wrapper_start_addr + 1024)
+        # Cap the instruction count when the zero-fill fallback is enabled, so a
+        # wrapper that ends up looping over zero-filled memory can't hang.
+        instruction_limit = MAX_EMULATED_INSTRUCTIONS if map_missing_as_zero \
+            else 0
+        uc.emu_start(wrapper_start_addr, wrapper_start_addr + 1024, 0,
+                     instruction_limit)
 
-        # Read and return PC
+        # Read and return the resolved address
         pc = uc.reg_read(result_register)
         assert isinstance(pc, int)
+
+        # Only accept a result that is actually an exported function. The result
+        # register is set to the resolved API's address by `_unicorn_hook_block`
+        # (which only stops on addresses that are known exports). If emulation
+        # stopped for any other reason (e.g. it reached the `until` address or
+        # `ret`'d to the magic return address), the register holds a leftover
+        # value that must not be treated as a resolved import: doing so would
+        # write a bogus entry into the rebuilt IAT and crash the dumped binary.
+        exports_dict = process_controller.enumerate_exported_functions()
+        if pc not in exports_dict:
+            LOG.debug("Discarding non-export emulation result: %s", hex(pc))
+            return None
 
         return pc
     except UcError as e:
@@ -126,33 +147,51 @@ def _setup_teb_x64(uc: Uc, process_info: ProcessController) -> None:
 
 
 def _unicorn_hook_unmapped(uc: Uc, _access: Any, address: int, _size: int,
-                           _value: int,
-                           process_controller: ProcessController) -> bool:
+                           _value: int, user_data: Tuple[ProcessController,
+                                                         bool]) -> bool:
+    process_controller, map_missing_as_zero = user_data
     LOG.debug("Unmapped memory at %s", hex(address))
-    if address == 0:
-        return False
 
     page_size = process_controller.page_size
     aligned_addr = address - (address & (page_size - 1))
-    try:
-        in_process_data = process_controller.read_process_memory(
-            aligned_addr, page_size)
-        uc.mem_map(aligned_addr, len(in_process_data), UC_PROT_ALL)
-        uc.mem_write(aligned_addr, in_process_data)
-        LOG.debug("Mapped %d bytes at %s", len(in_process_data),
-                  hex(aligned_addr))
-        return True
-    except UcError as e:
-        LOG.error("ERROR: %s", str(e))
-        return False
-    except ReadProcessMemoryError as e:
-        # Log this error as debug as it's expected to happen in cases where we
-        # reach the end of the IAT.
-        LOG.debug("ERROR: %s", str(e))
-        return False
-    except Exception as e:
-        LOG.error("ERROR: %s", str(e))
-        return False
+
+    # Try to bring in the real page from the target process first (unless the
+    # faulting address is obviously invalid, e.g. a near-null dereference).
+    if address >= page_size:
+        try:
+            in_process_data = process_controller.read_process_memory(
+                aligned_addr, page_size)
+            uc.mem_map(aligned_addr, len(in_process_data), UC_PROT_ALL)
+            uc.mem_write(aligned_addr, in_process_data)
+            LOG.debug("Mapped %d bytes at %s", len(in_process_data),
+                      hex(aligned_addr))
+            return True
+        except ReadProcessMemoryError as e:
+            # Expected e.g. when reaching the end of the IAT, or when emulated
+            # helper/decoy code dereferences memory that isn't mapped in the
+            # target either. Fall through to the zero-fill fallback below.
+            LOG.debug("ERROR: %s", str(e))
+        except UcError as e:
+            LOG.error("ERROR: %s", str(e))
+            return False
+        except Exception as e:
+            LOG.error("ERROR: %s", str(e))
+            return False
+
+    # Aggressive fallback: map a zero-filled page so emulation can keep going
+    # through anti-emulation decoy code (e.g. wrappers that call real helper
+    # APIs during resolution) instead of aborting. The final result is still
+    # validated against the known exports, so a wrong path yields "unresolved"
+    # rather than a bogus import.
+    if map_missing_as_zero:
+        try:
+            uc.mem_map(aligned_addr, page_size, UC_PROT_ALL)
+            LOG.debug("Mapped zero page at %s", hex(aligned_addr))
+            return True
+        except UcError as e:
+            LOG.debug("ERROR (zero map): %s", str(e))
+
+    return False
 
 
 def _unicorn_hook_block(uc: Uc, address: int, _size: int,

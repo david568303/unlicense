@@ -1,6 +1,51 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- Add a `--runtime_imports` option (Themida/WinLicense 2.x) that resolves import
+  wrappers which defeat static emulation but point inside a loaded module
+  (imports the packer redirected a few bytes into the real API) by mapping each
+  target to the entry of the export whose function contains it. No wrapper code
+  is executed
+- Add an `--aggressive_imports` option (Themida/WinLicense 2.x) that lets the
+  emulation-based import resolver map missing memory as zero (bounded by an
+  instruction cap) instead of aborting. This can recover imports whose wrappers
+  use anti-emulation tricks (e.g. calling real helper APIs during resolution).
+  Resolutions are still validated against the known exports, so it won't add
+  bogus imports, though it may resolve a wrapper incorrectly
+
+### Fixed
+- Fix OEP detection for Themida/WinLicense 2.x executables where the packer
+  restores the original protection of the `.text` section at the section's
+  base instead of the module's base (the OEP trap was never armed, causing a
+  timeout)
+- Make arming of the OEP trap robust to large/sparse `.text` sections by
+  falling back to page-by-page protection when a bulk `Memory.protect` call
+  fails
+- Only "allow" read/write access violations that target the trapped OEP
+  ranges. Faults elsewhere (used by the packer for control flow / anti-debug,
+  or on unmapped memory) are now let through to the process's own exception
+  handlers instead of being swallowed or turned into an unhandled crash
+- Reject false-positive TLS callback detections by requiring the entry to be
+  invoked by the Windows loader (return address in `ntdll`). This prevents
+  "skipping" the real OEP (via a forced `ret`), which could crash the target
+  before the OEP was reported
+- Discard emulation-based import resolutions whose result isn't a known
+  export. When the wrapper emulation stopped without reaching an API, a
+  leftover register value was accepted as a resolved import, producing a bogus
+  IAT entry that crashed the dumped binary (Themida/WinLicense 2.x)
+- Report the number of import wrappers that couldn't be resolved (and their
+  call sites in verbose mode) instead of silently producing a dump whose
+  unresolved imports crash at runtime
+
+### Changed
+- Arm the OEP trap only on protection changes targeting the module base or the
+  expected OEP ranges, instead of anywhere in the module. This avoids
+  repeatedly re-trapping `.text` (and the burst of extra access violations that
+  follows) while the packer runs, reducing the chance of tripping its
+  timing-based anti-debugging
+- Increase the default OEP detection timeout from 10 to 30 seconds
+- Make the timeout error message suggest increasing `--timeout`
 
 ## [0.4.0] - 2023-08-14
 ### Added

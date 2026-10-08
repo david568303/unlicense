@@ -1,6 +1,6 @@
 import logging
 import struct
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Set, Tuple, Any, Optional
 
 from capstone import (  # type: ignore
     Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64)
@@ -15,9 +15,13 @@ from .process_control import (ProcessController, Architecture, MemoryRange,
 LOG = logging.getLogger(__name__)
 
 
-def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
-                    image_base: int, oep: int,
-                    text_section_range: MemoryRange) -> None:
+def fix_and_dump_pe(process_controller: ProcessController,
+                    pe_file_path: str,
+                    image_base: int,
+                    oep: int,
+                    text_section_range: MemoryRange,
+                    aggressive_imports: bool = False,
+                    runtime_imports: bool = False) -> None:
     """
     Main dumping routine for Themida/WinLicense 2.x.
     """
@@ -57,9 +61,11 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
                                                 process_controller)
 
     LOG.info("Resolving imports ...")
-    _resolve_imports(api_to_calls, wrapper_set, export_hashes, md,
-                     process_controller)
-    LOG.info("Imports resolved: %d", len(api_to_calls))
+    unresolved_count = _resolve_imports(api_to_calls, wrapper_set,
+                                        export_hashes, md, process_controller,
+                                        aggressive_imports, runtime_imports)
+    LOG.info("Imports resolved: %d (unresolved wrappers: %d)",
+             len(api_to_calls), unresolved_count)
 
     iat_addr, iat_size = _generate_new_iat_in_process(api_to_calls,
                                                       text_section_range.base,
@@ -123,12 +129,58 @@ def _generate_export_hashes(
     return result
 
 
+# Maximum distance (in bytes) between a redirected import target and the entry
+# of the export that contains it. The packer redirects imports a few bytes past
+# the real API's entry, so the gap is small; a cap avoids mapping an address in
+# a code gap to an unrelated export far above it.
+_MAX_REDIRECT_OFFSET = 0x1000
+
+
+def _resolve_redirected_import(
+        wrapper_addr: int,
+        process_controller: ProcessController) -> Optional[int]:
+    """
+    Resolve a wrapper that points inside a loaded module (an import the packer
+    redirected a few bytes into the real API) to the entry of the export whose
+    function contains it.
+    """
+    export = process_controller.find_enclosing_export(wrapper_addr)
+    if export is None:
+        return None
+    export_addr: int = export["address"]
+    offset = wrapper_addr - export_addr
+    if offset < 0 or offset > _MAX_REDIRECT_OFFSET:
+        LOG.debug(
+            "Enclosing export for %s is %s (offset %s), too far; ignoring",
+            hex(wrapper_addr), hex(export_addr), hex(offset))
+        return None
+    LOG.debug("Resolved redirected import: %s -> %s (%s, offset %s)",
+              hex(wrapper_addr), hex(export_addr), export.get("name"),
+              hex(offset))
+    return export_addr
+
+
 def _resolve_imports(api_to_calls: ImportToCallSiteDict,
                      wrapper_set: WrapperSet,
-                     export_hashes: Optional[Dict[int, int]], md: Cs,
-                     process_controller: ProcessController) -> None:
+                     export_hashes: Optional[Dict[int, int]],
+                     md: Cs,
+                     process_controller: ProcessController,
+                     aggressive_imports: bool = False,
+                     runtime_imports: bool = False) -> int:
     """
     Resolve potential import wrappers by hash-matching or emulation.
+
+    When `aggressive_imports` is set, the emulation-based resolution maps
+    missing memory as zero instead of aborting, which can resolve wrappers that
+    use anti-emulation tricks (at the cost of potentially wrong resolutions, so
+    results are validated against the known exports).
+
+    When `runtime_imports` is set, wrappers that can't be resolved statically
+    but point inside a loaded module (imports the packer redirected into the
+    real API) are resolved to the enclosing export. This handles wrappers that
+    defeat emulation.
+
+    Returns the number of distinct wrappers that couldn't be resolved.
     """
     arch = process_controller.architecture
     page_size = process_controller.page_size
@@ -144,7 +196,7 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
 
     # Iterate over the set of potential import wrappers and try to resolve them
     resolved_wrappers: Dict[int, int] = {}
-    problematic_wrappers = set()
+    problematic_wrappers: Set[int] = set()
     for call_addr, call_size, instr_was_jmp, wrapper_addr, _ in wrapper_set:
         resolved_addr = resolved_wrappers.get(wrapper_addr)
         if resolved_addr is not None:
@@ -182,8 +234,19 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
                     continue
 
         # Try to resolve the destination address by emulating the wrapper
-        resolved_addr = resolve_wrapped_api(call_addr, process_controller,
-                                            call_addr + call_size)
+        resolved_addr = resolve_wrapped_api(
+            call_addr,
+            process_controller,
+            call_addr + call_size,
+            map_missing_as_zero=aggressive_imports)
+
+        # As a last resort, if the wrapper points inside a loaded module (an
+        # import the packer redirected into the real API), resolve it to the
+        # enclosing export.
+        if resolved_addr is None and runtime_imports:
+            resolved_addr = _resolve_redirected_import(wrapper_addr,
+                                                       process_controller)
+
         if resolved_addr is not None:
             LOG.debug("Resolved API: %s -> %s", hex(wrapper_addr),
                       hex(resolved_addr))
@@ -192,6 +255,23 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
                 (call_addr, call_size, instr_was_jmp))
         else:
             problematic_wrappers.add(wrapper_addr)
+
+    # Report wrappers that couldn't be resolved: their call/jmp sites won't be
+    # patched to point at the rebuilt IAT, so the dumped binary is likely to
+    # crash when it reaches them.
+    if problematic_wrappers:
+        unresolved_call_sites = [
+            entry[0] for entry in wrapper_set
+            if entry[3] in problematic_wrappers
+        ]
+        LOG.warning(
+            "Failed to resolve %d import wrapper(s), affecting %d call site(s). "
+            "The dumped binary may crash when calling these imports.",
+            len(problematic_wrappers), len(unresolved_call_sites))
+        for wrapper_addr in sorted(problematic_wrappers):
+            LOG.debug("Unresolved wrapper at %s", hex(wrapper_addr))
+
+    return len(problematic_wrappers)
 
 
 def _generate_new_iat_in_process(

@@ -95,6 +95,22 @@ class FridaProcessController(ProcessController):
             return exports_dict
         return self._exported_functions_cache
 
+    def find_enclosing_export(self, address: int) -> Optional[Dict[str, Any]]:
+        try:
+            result: Optional[Dict[
+                str,
+                Any]] = self._frida_rpc.find_enclosing_export(hex(address))
+        except frida.core.RPCException as rpc_exception:
+            LOG.debug("find_enclosing_export failed for %s: %s", hex(address),
+                      str(rpc_exception))
+            return None
+        if result is None:
+            return None
+        return {
+            "address": int(result["address"], 16),
+            "name": result.get("name"),
+        }
+
     def allocate_process_memory(self, size: int, near: int) -> int:
         buffer_addr = self._frida_rpc.allocate_process_memory(size, near)
         return int(buffer_addr, 16)
@@ -179,8 +195,11 @@ def _str_to_architecture(frida_arch: str) -> Architecture:
 
 
 def spawn_and_instrument(
-        pe_path: Path, text_section_ranges: List[MemoryRange],
-        notify_oep_reached: OepReachedCallback) -> ProcessController:
+    pe_path: Path,
+    text_section_ranges: List[MemoryRange],
+    notify_oep_reached: OepReachedCallback,
+    notify_detached: Optional[Callable[...,
+                                       None]] = None) -> ProcessController:
     pid: int
     if pe_path.suffix == ".dll":
         # Use `rundll32` to load the DLL
@@ -193,6 +212,10 @@ def spawn_and_instrument(
 
     main_module_name = pe_path.name
     session = frida.attach(pid)
+    # Get notified if the target goes away (e.g. it crashes or exits before the
+    # OEP is reached), so callers don't block until their timeout.
+    if notify_detached is not None:
+        session.on('detached', notify_detached)
     frida_js = resources.open_text("unlicense.resources", "frida.js").read()
     script = session.create_script(frida_js)
     on_message_callback = functools.partial(_frida_callback,

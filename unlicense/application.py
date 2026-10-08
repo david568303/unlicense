@@ -3,7 +3,7 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import fire  # type: ignore
 
@@ -28,10 +28,26 @@ def run_unlicense(
     no_imports: bool = False,
     force_oep: Optional[int] = None,
     target_version: Optional[int] = None,
-    timeout: int = 10,
+    timeout: int = 30,
+    aggressive_imports: bool = False,
+    runtime_imports: bool = False,
 ) -> None:
     """
     Unpack executables protected with Themida/WinLicense 2.x and 3.x
+
+    `aggressive_imports` (Themida/WinLicense 2.x only) makes the emulation-based
+    import resolver map missing memory as zero instead of giving up, which can
+    recover imports whose wrappers use anti-emulation tricks (e.g. calling real
+    helper APIs during resolution). It's a best-effort heuristic: resolutions
+    are validated against the known exports, so it won't add bogus imports, but
+    it may still resolve a wrapper incorrectly. Use it when a default run leaves
+    import wrappers unresolved and the dumped binary crashes.
+
+    `runtime_imports` (Themida/WinLicense 2.x only) resolves import wrappers
+    that can't be resolved statically but point inside a loaded module (imports
+    the packer redirected a few bytes into the real API). Each such target is
+    resolved to the entry of the export whose function contains it. This handles
+    wrappers that defeat emulation, without executing any wrapper code.
     """
     setup_logger(LOG, verbose)
 
@@ -69,24 +85,49 @@ def run_unlicense(
     dumped_image_base = 0
     dumped_oep = 0
     is_dotnet = False
-    oep_reached = threading.Event()
+    oep_reached = False
+    # Signaled when the OEP is reached or when the target process goes away.
+    instrumentation_done = threading.Event()
+    detach_reason: List[str] = []
 
     def notify_oep_reached(image_base: int, oep: int, dotnet: bool) -> None:
         nonlocal dumped_image_base
         nonlocal dumped_oep
         nonlocal is_dotnet
+        nonlocal oep_reached
         dumped_image_base = image_base
         dumped_oep = oep
         is_dotnet = dotnet
-        oep_reached.set()
+        oep_reached = True
+        instrumentation_done.set()
+
+    def notify_process_detached(reason: str, *_args: object) -> None:
+        # Called by Frida when the session detaches (e.g. the target exited or
+        # crashed). Unblock the wait so we don't sit until the timeout.
+        detach_reason.append(reason)
+        instrumentation_done.set()
 
     # Spawn the packed executable and instrument it to find its OEP
     process_controller = frida_exec.spawn_and_instrument(
-        pe_path, text_section_ranges, notify_oep_reached)
+        pe_path, text_section_ranges, notify_oep_reached,
+        notify_process_detached)
     try:
-        # Block until OEP is reached
-        if not oep_reached.wait(float(timeout)):
-            LOG.error("Original entry point wasn't reached before timeout")
+        # Block until the OEP is reached or the process goes away
+        if not instrumentation_done.wait(float(timeout)):
+            LOG.error(
+                "Original entry point wasn't reached before timeout (%ds). "
+                "The target might need more time to unpack: try increasing "
+                "the timeout with '--timeout <seconds>'.", timeout)
+            sys.exit(4)
+
+        # The process died (crashed or exited) before the OEP was reached
+        if not oep_reached:
+            LOG.error(
+                "The target process exited before the original entry point was "
+                "reached (reason: %s). This is typically caused by the packer's "
+                "anti-debugging/anti-tampering detecting the instrumentation. "
+                "Unpacking can be non-deterministic, so retrying may succeed.",
+                detach_reason[0] if detach_reason else "unknown")
             sys.exit(4)
 
         LOG.info("OEP reached: OEP=%s BASE=%s DOTNET=%r", hex(dumped_oep),
@@ -117,7 +158,8 @@ def run_unlicense(
         elif target_version == 2:
             winlicense2.fix_and_dump_pe(process_controller, pe_to_dump,
                                         dumped_image_base, dumped_oep,
-                                        text_section_range)
+                                        text_section_range, aggressive_imports,
+                                        runtime_imports)
         elif target_version == 3:
             winlicense3.fix_and_dump_pe(process_controller, pe_to_dump,
                                         dumped_image_base, dumped_oep,

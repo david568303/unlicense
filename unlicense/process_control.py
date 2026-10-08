@@ -73,6 +73,17 @@ class ProcessController(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def find_enclosing_export(self, address: int) -> Optional[Dict[str, Any]]:
+        """
+        Resolve an address located inside a loaded module to the export whose
+        function contains it (the closest export entry at or below `address`,
+        within the same module). Returns a dict with `address` (int) and `name`
+        (str), or `None` if the address isn't inside a module or no export
+        precedes it.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def allocate_process_memory(self, size: int, near: int) -> int:
         raise NotImplementedError
 

@@ -46,6 +46,17 @@ function rangeContainsAddress(range, address) {
     return rangeStart.compare(address) <= 0 && rangeEnd.compare(address) > 0;
 }
 
+function addressInExpectedOepRanges(dumpedModule, expectedOepRanges, address) {
+    for (const oepRange of expectedOepRanges) {
+        const sectionStart = dumpedModule.base.add(oepRange[0]);
+        const sectionRange = { base: sectionStart, size: oepRange[1] };
+        if (rangeContainsAddress(sectionRange, address)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function notifyOepFound(dumpedModule, oepCandidate) {
     oepReached = true;
     
@@ -70,9 +81,34 @@ function makeOepRangesInaccessible(dumpedModule, expectedOepRanges) {
     expectedOepRanges.forEach((oepRange) => {
         const sectionStart = dumpedModule.base.add(oepRange[0]);
         const expectedSectionSize = oepRange[1];
-        Memory.protect(sectionStart, expectedSectionSize, '---');
-        originalPageProtections.set(sectionStart.toString(), expectedSectionSize);
+        try {
+            Memory.protect(sectionStart, expectedSectionSize, '---');
+            originalPageProtections.set(sectionStart.toString(), expectedSectionSize);
+        } catch (e) {
+            // The section's virtual size (from the on-disk headers) can be
+            // large (several MiB for packed executables) and may cover pages
+            // that aren't currently committed, which makes a single
+            // `Memory.protect` call over the whole range fail. Protecting the
+            // range page by page ensures a single failing page doesn't leave
+            // the whole trap unarmed (which would cause the OEP to never be
+            // reached).
+            protectRangePageByPage(sectionStart, expectedSectionSize);
+        }
     });
+}
+
+function protectRangePageByPage(rangeStart, rangeSize) {
+    const pageSize = Process.pageSize;
+    for (let offset = 0; offset < rangeSize; offset += pageSize) {
+        const pageAddr = rangeStart.add(offset);
+        const chunkSize = Math.min(pageSize, rangeSize - offset);
+        try {
+            Memory.protect(pageAddr, chunkSize, '---');
+            originalPageProtections.set(pageAddr.toString(), chunkSize);
+        } catch (e) {
+            // Skip pages that can't be protected (e.g. not committed).
+        }
+    }
 }
 
 function setOepRangesProtection(protection) {
@@ -116,12 +152,25 @@ function registerExceptionHandler(dumpedModule, expectedOepRanges, moduleIsDll) 
                 notifyOepFound(dumpedModule, oepCandidate);
             }
 
-            // If the access violation is not an execution, "allow" the operation.
-            // Note: Pages will be reprotected on the next call to
-            // `NtProtectVirtualMemory`.
-            if (exp.memory.operation != "execute") {
-                Memory.protect(exp.memory.address, Process.pageSize, "rw-");
-                return true;
+            // If the access violation is a read/write on one of the pages we
+            // deliberately made inaccessible (the expected OEP ranges), "allow"
+            // the operation. Note: Pages will be reprotected on the next call
+            // to `NtProtectVirtualMemory`.
+            // Only handle faults that target our trapped ranges: the packer
+            // triggers access violations of its own (for control flow and
+            // anti-debugging) and may legitimately dereference memory outside
+            // those ranges. Swallowing those would break the packer, and trying
+            // to `Memory.protect` an unmapped address would throw and turn the
+            // fault into an unhandled crash. Let such faults propagate to the
+            // process's own exception handlers instead.
+            if (exp.memory.operation != "execute" &&
+                addressInExpectedOepRanges(dumpedModule, expectedOepRanges, exp.memory.address)) {
+                try {
+                    Memory.protect(exp.memory.address, Process.pageSize, "rw-");
+                    return true;
+                } catch (e) {
+                    return false;
+                }
             }
         }
 
@@ -202,6 +251,32 @@ function isTlsCallback(exceptionCtx, dumpedModule) {
         return false;
     }
 
+    // The checks above are only a heuristic (first argument is the module base,
+    // second argument is a small "reason" value). The packer can reach the real
+    // OEP (or a jump stub to it) with the module base in the first-argument
+    // register and a small value in the second, which would match that
+    // heuristic by coincidence. Genuine TLS callbacks are invoked by the
+    // Windows loader (`ntdll`) via a `call`, so the return address at the top of
+    // the stack points into `ntdll`. Requiring that rejects those false
+    // positives: without it we would "skip" the OEP by forcing a `ret`, which,
+    // when the code was reached by a `jmp` instead of a `call`, pops a
+    // non-return value off the stack and transfers execution to a garbage
+    // address, crashing the process before the OEP is ever reported.
+    try {
+        const returnAddress = exceptionCtx.sp.readPointer();
+        const callerModule = Process.findModuleByAddress(returnAddress);
+        if (callerModule == null || callerModule.name.toLowerCase() != "ntdll.dll") {
+            const callerName = callerModule == null ? "<unknown>" : callerModule.name;
+            log(`Ignoring TLS-callback-like entry at ${exceptionCtx.pc} ` +
+                `(return address ${returnAddress} is in ${callerName}, not ntdll); ` +
+                `treating it as a potential OEP`);
+            return false;
+        }
+    } catch (e) {
+        // If the stack can't be read for some reason, fall back to the
+        // register/stack heuristic result (i.e. treat it as a TLS callback).
+    }
+
     return true;
 }
 
@@ -263,7 +338,26 @@ rpc.exports = {
             const ntProtectVirtualMemoryListener = Interceptor.attach(ntProtectVirtualMemory, {
                 onEnter: function (args) {
                     let addr = args[1].readPointer();
-                    if (dumpedModule != null && addr.equals(dumpedModule.base)) {
+                    // Arm the OEP trap when a protection change targets the
+                    // module base or one of the expected OEP ranges (the
+                    // `.text` section). The `BaseAddress` passed to
+                    // `NtProtectVirtualMemory` is rounded down to a page
+                    // boundary by the kernel, so when the packer restores the
+                    // original protection of the `.text` section this address
+                    // is the section's base (e.g. `base + 0x1000`), not the
+                    // module's base. Only matching the module base would miss
+                    // that common case and leave the trap unarmed (the OEP would
+                    // then never be reached, timing out).
+                    // We intentionally do NOT arm on protection changes to the
+                    // rest of the module (e.g. the packer's own sections):
+                    // re-arming makes the OEP ranges inaccessible again, which
+                    // triggers a burst of extra access violations as the packer
+                    // keeps running. That overhead can trip the packer's
+                    // timing-based anti-debugging, so keep the trap as quiet as
+                    // possible while still catching the entry point.
+                    if (dumpedModule != null &&
+                        (addr.equals(dumpedModule.base) ||
+                         addressInExpectedOepRanges(dumpedModule, expectedOepRanges, addr))) {
                         // Reset potential OEP ranges to not accessible to
                         // (hopefully) catch the entry point next time.
                         makeOepRangesInaccessible(dumpedModule, expectedOepRanges);
@@ -387,5 +481,31 @@ rpc.exports = {
     },
     writeProcessMemory: function (address, bytes) {
         return Memory.writeByteArray(ptr(address), bytes);
+    },
+    findEnclosingExport: function (address) {
+        // Resolve an address that lies inside a loaded module to the export
+        // whose function contains it (the export with the largest entry that is
+        // <= `address`, within the same module). Used to resolve imports that
+        // the packer redirected a few bytes into the real API.
+        const addr = ptr(address);
+        const module = Process.findModuleByAddress(addr);
+        if (module == null) {
+            return null;
+        }
+        let best = null;
+        module.enumerateExports().forEach(exp => {
+            if (exp.type != "function") {
+                return;
+            }
+            // exp.address <= addr, and the closest such export
+            if (exp.address.compare(addr) <= 0 &&
+                (best == null || exp.address.compare(best.address) > 0)) {
+                best = exp;
+            }
+        });
+        if (best == null) {
+            return null;
+        }
+        return { address: best.address.toString(), name: best.name };
     }
 };
