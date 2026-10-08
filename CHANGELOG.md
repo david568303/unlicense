@@ -13,6 +13,8 @@
   wrappers that are never reached during passive tracing.
 
 ### Fixed
+- Skip the final imported API during active wrapper probing so synthetic
+  arguments cannot terminate or corrupt the target process.
 - Simulate Windows heap APIs while resolving import wrappers instead of
   executing the real heap implementation with an incomplete emulated PEB.
 - Bound wrapper emulation and keep synthetic heap allocation local to Unicorn

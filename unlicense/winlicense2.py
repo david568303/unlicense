@@ -280,7 +280,7 @@ def _resolve_imports(
         if active_wrapper_probe:
             LOG.warning(
                 "Actively invoking %d unresolved wrappers with synthetic "
-                "arguments; the target may crash or have side effects",
+                "arguments; final imported API bodies will be skipped",
                 len(trace_requests))
         if native_trace_timeout > 0:
             LOG.warning(

@@ -66,9 +66,11 @@ each unresolved call site while the OEP thread is still blocked:
 
 The active probe supplies synthetic zero-filled arguments and temporarily
 places a jump to controlled stack cleanup after each probed CALL. It restores
-the original bytes immediately afterward, but the resolved Windows API is
-really invoked.
-It can therefore crash, terminate, or otherwise affect the target process.
+the original bytes immediately afterward. Once the wrapper reaches its final
+Windows API, the tracer records the address and skips the API body instead of
+invoking it with synthetic arguments.
+Intermediate APIs used internally by the wrapper still execute and may have
+side effects, so the probe remains experimental.
 Use this option only in a disposable, isolated VM snapshot. It currently
 supports 32-bit targets only. `--native_trace_timeout` may be combined with it,
 but is not required. Each active call is isolated in a probe thread and limited

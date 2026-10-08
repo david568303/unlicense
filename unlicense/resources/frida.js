@@ -369,6 +369,7 @@ rpc.exports = {
 
         const state = {
             activeByThread: new Map(),
+            activeProbesByThread: new Map(),
             followedThreads: new Set(),
             resolutions: new Map(),
             wrapperRequests: wrappers,
@@ -384,6 +385,7 @@ rpc.exports = {
                 compiledBlocks: 0,
                 exportHits: 0,
                 returnHits: 0,
+                skippedFinalApis: 0,
                 wrapperHits: 0,
                 threadIds: []
             }
@@ -444,22 +446,57 @@ rpc.exports = {
                 }
 
                 if (exportInfo !== undefined) {
-                    iterator.putCallout(context => {
-                        state.stats.exportHits++;
-                        const active = state.activeByThread.get(threadId);
-                        if (active === undefined) {
-                            return;
-                        }
-                        active.lastExport = exportInfo;
-                        try {
-                            if (context.sp.readPointer().equals(active.nativeReturn)) {
-                                saveResolution(threadId, exportInfo);
+                    const activeProbe = state.activeProbesByThread.get(threadId);
+                    if (activeProbe !== undefined) {
+                        iterator.putCallout(context => {
+                            state.stats.exportHits++;
+                            const active = state.activeByThread.get(threadId);
+                            if (active === undefined) {
+                                return;
                             }
-                        }
-                        catch (_error) {
-                            // Keep tracing until the known return site is reached.
-                        }
-                    });
+                            active.lastExport = exportInfo;
+                            try {
+                                if (context.sp.readPointer().equals(
+                                        active.nativeReturn)) {
+                                    // This is the final imported API. Record it
+                                    // and redirect to controlled cleanup instead
+                                    // of executing it with synthetic arguments.
+                                    activeProbe.finalApiFlag.writeU32(1);
+                                    state.stats.skippedFinalApis++;
+                                    saveResolution(threadId, exportInfo);
+                                }
+                            }
+                            catch (_error) {
+                                // Keep tracing until a final export is reached.
+                            }
+                        });
+                        iterator.putCmpImmPtrImmU32(activeProbe.finalApiFlag, 1);
+                        iterator.putJccShortLabel('jne', 'keep_export_body',
+                                                  'no-hint');
+                        iterator.putMovRegAddress('eax',
+                                                  activeProbe.cleanupAddress);
+                        iterator.putJmpReg('eax');
+                        iterator.putLabel('keep_export_body');
+                    }
+                    else {
+                        iterator.putCallout(context => {
+                            state.stats.exportHits++;
+                            const active = state.activeByThread.get(threadId);
+                            if (active === undefined) {
+                                return;
+                            }
+                            active.lastExport = exportInfo;
+                            try {
+                                if (context.sp.readPointer().equals(
+                                        active.nativeReturn)) {
+                                    saveResolution(threadId, exportInfo);
+                                }
+                            }
+                            catch (_error) {
+                                // Keep tracing until the known return site.
+                            }
+                        });
+                    }
                 }
 
                 if (returnCandidates !== undefined) {
@@ -598,6 +635,12 @@ rpc.exports = {
                     throw new Error('CreateThread failed');
                 }
                 probeThreadId = threadIdStorage.readU32();
+                const finalApiFlag = Memory.alloc(4);
+                finalApiFlag.writeU32(0);
+                state.activeProbesByThread.set(probeThreadId, {
+                    cleanupAddress: cleanupAddress,
+                    finalApiFlag: finalApiFlag
+                });
                 Stalker.follow(probeThreadId,
                                state.makeTraceOptions(probeThreadId));
                 state.followedThreads.add(probeThreadId);
@@ -635,6 +678,7 @@ rpc.exports = {
                         // The probe thread may already have exited.
                     }
                     state.followedThreads.delete(probeThreadId);
+                    state.activeProbesByThread.delete(probeThreadId);
                 }
                 if (threadHandle !== null) {
                     closeHandle(threadHandle);

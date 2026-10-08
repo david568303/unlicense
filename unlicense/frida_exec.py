@@ -94,12 +94,13 @@ class FridaProcessController(ProcessController):
             LOG.info(
                 "Native trace stats: threads=%d blocks=%d wrapper_hits=%d "
                 "export_hits=%d return_hits=%d active_probes=%d "
-                "active_returns=%d active_errors=%d",
+                "active_returns=%d skipped_final_apis=%d active_errors=%d",
                 len(stats.get("threadIds",
                               [])), stats.get("compiledBlocks", 0),
                 stats.get("wrapperHits", 0), stats.get("exportHits", 0),
                 stats.get("returnHits", 0), stats.get("activeProbes", 0),
                 stats.get("activeProbeReturns", 0),
+                stats.get("skippedFinalApis", 0),
                 len(stats.get("activeProbeErrors", [])))
             for probe_error in stats.get("activeProbeErrors", []):
                 LOG.debug("Active wrapper probe error: %s", probe_error)
