@@ -69,9 +69,11 @@ class ProcessController(abc.ABC):
             wrappers: List[Dict[str, Any]],
             timeout_ms: int,
             active_probe: bool = False,
-            active_probe_timeout_ms: int = 5000) -> Dict[int, int]:
+            active_probe_timeout_ms: int = 5000,
+            active_probe_profile: str = "zero") -> Dict[int, int]:
         """Resolve wrappers through native execution when supported."""
-        del wrappers, timeout_ms, active_probe, active_probe_timeout_ms
+        del (wrappers, timeout_ms, active_probe, active_probe_timeout_ms,
+             active_probe_profile)
         return {}
 
     @abc.abstractmethod

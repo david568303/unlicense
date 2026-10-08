@@ -110,7 +110,8 @@ class FridaProcessController(ProcessController):
             wrappers: List[Dict[str, Any]],
             timeout_ms: int,
             active_probe: bool = False,
-            active_probe_timeout_ms: int = 5000) -> Dict[int, int]:
+            active_probe_timeout_ms: int = 5000,
+            active_probe_profile: str = "zero") -> Dict[int, int]:
         rpc_grace_ms = 10000
 
         def setup_trace() -> None:
@@ -121,7 +122,8 @@ class FridaProcessController(ProcessController):
         if active_probe:
 
             def probe_trace() -> None:
-                self._frida_rpc.probe_wrapper_trace(active_probe_timeout_ms)
+                self._frida_rpc.probe_wrapper_trace(active_probe_timeout_ms,
+                                                    active_probe_profile)
 
             _call_with_timeout(probe_trace,
                                active_probe_timeout_ms + rpc_grace_ms,

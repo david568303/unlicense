@@ -231,6 +231,12 @@ def _unicorn_hook_block(uc: Uc, address: int, _size: int,
     else:
         raise NotImplementedError(f"Unsupported architecture: {arch}")
 
+    if address == STACK_MAGIC_RET_ADDR:
+        diagnostic["returned_without_export"] = True
+        diagnostic["pc"] = hex(address)
+        uc.emu_stop()
+        return
+
     exports_dict = process_controller.enumerate_exported_functions()
     if address in exports_dict:
         # Reached an export or returned to the call site

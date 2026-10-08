@@ -79,6 +79,18 @@ function makeOepRangesInaccessible(dumpedModule, expectedOepRanges) {
     });
 }
 
+function overlapsExpectedOepRange(dumpedModule, expectedOepRanges,
+                                  address, size) {
+    const changeStart = address;
+    const changeEnd = address.add(Math.max(1, size));
+    return expectedOepRanges.some(oepRange => {
+        const rangeStart = dumpedModule.base.add(oepRange[0]);
+        const rangeEnd = rangeStart.add(oepRange[1]);
+        return changeStart.compare(rangeEnd) < 0 &&
+            changeEnd.compare(rangeStart) > 0;
+    });
+}
+
 function setOepRangesProtection(protection) {
     // Set pages' protection
     originalPageProtections.forEach((size, address_str, _map) => {
@@ -96,6 +108,13 @@ function removeOepTracingHooks() {
 function registerExceptionHandler(dumpedModule, expectedOepRanges, moduleIsDll) {
     // Register an exception handler that'll detect the OEP
     Process.setExceptionHandler(exp => {
+        // Once an EXE reached its OEP, its own exception-driven wrappers must
+        // see access violations and INT3 exceptions. The discovery handler's
+        // permissive memory-fault recovery would otherwise swallow them and
+        // can turn a valid Themida wrapper into an infinite native trace.
+        if (oepReached && !moduleIsDll) {
+            return false;
+        }
         let oepCandidate = exp.context.pc;
         let threadId = Process.getCurrentThreadId();
 
@@ -265,19 +284,45 @@ rpc.exports = {
         oepTracingListeners.push(loadDllListener);
 
         let exceptionHandlerRegistered = false;
+        let reprotectingOep = false;
         const ntProtectVirtualMemory = Module.findExportByName('ntdll', 'NtProtectVirtualMemory');
         if (ntProtectVirtualMemory != null) {
             const ntProtectVirtualMemoryListener = Interceptor.attach(ntProtectVirtualMemory, {
                 onEnter: function (args) {
-                    let addr = args[1].readPointer();
-                    if (dumpedModule != null && addr.equals(dumpedModule.base)) {
-                        // Reset potential OEP ranges to not accessible to
-                        // (hopefully) catch the entry point next time.
-                        makeOepRangesInaccessible(dumpedModule, expectedOepRanges);
+                    this.rearmOep = false;
+                    if (dumpedModule == null || reprotectingOep) {
+                        return;
+                    }
+                    try {
+                        const address = args[1].readPointer();
+                        const size = args[2].readPointer().toUInt32();
+                        this.rearmOep = overlapsExpectedOepRange(
+                            dumpedModule, expectedOepRanges, address, size);
+                    }
+                    catch (_error) {
+                        this.rearmOep = false;
+                    }
+                },
+                onLeave: function (_retval) {
+                    if (!this.rearmOep || dumpedModule == null ||
+                            oepReached || reprotectingOep) {
+                        return;
+                    }
+                    // Re-arm after NtProtectVirtualMemory returns. Re-arming
+                    // on entry is unreliable because the original syscall
+                    // immediately overwrites our protection change.
+                    reprotectingOep = true;
+                    try {
+                        makeOepRangesInaccessible(dumpedModule,
+                                                  expectedOepRanges);
                         if (!exceptionHandlerRegistered) {
-                            registerExceptionHandler(dumpedModule, expectedOepRanges, targetIsDll);
+                            registerExceptionHandler(
+                                dumpedModule, expectedOepRanges, targetIsDll);
                             exceptionHandlerRegistered = true;
                         }
+                    }
+                    finally {
+                        reprotectingOep = false;
                     }
                 }
             });
@@ -552,7 +597,7 @@ rpc.exports = {
         // now needs to let the original thread continue normally.
         setOepRangesProtection('rwx');
     },
-    probeWrapperTrace: function (timeoutMs) {
+    probeWrapperTrace: function (timeoutMs, argumentProfile) {
         if (wrapperTraceState === null) {
             throw new Error('Native wrapper tracing is not initialized');
         }
@@ -563,6 +608,11 @@ rpc.exports = {
         const state = wrapperTraceState;
         const probeTimeoutMs = Math.max(
             100, Math.min(60000, Number(timeoutMs) || 5000));
+        const supportedProfiles = new Set(['zero', 'one', 'readable', 'mixed']);
+        const probeProfile = supportedProfiles.has(argumentProfile)
+            ? argumentProfile
+            : 'zero';
+        state.stats.argumentProfile = probeProfile;
         const nativeOptions = { abi: 'stdcall', exceptions: 'steal' };
         const createThread = new NativeFunction(
             Module.findExportByName('kernel32.dll', 'CreateThread'),
@@ -608,13 +658,30 @@ rpc.exports = {
             try {
                 const trampoline = Memory.alloc(Process.pageSize);
                 allocatedBuffers.push(trampoline);
+                const argumentBuffer = Memory.alloc(Process.pageSize);
+                argumentBuffer.writeByteArray(new Uint8Array(256));
+                allocatedBuffers.push(argumentBuffer);
                 const writer = new X86Writer(trampoline, { pc: trampoline });
                 writer.putPushReg('ebp');
                 writer.putMovRegReg('ebp', 'esp');
                 // Give wrappers and the resolved API a zero-filled argument
-                // area without making assumptions about their signatures.
+                // area by default. Alternate profiles are used only after an
+                // unresolved attempt to accommodate wrappers that inspect
+                // pointer or boolean arguments before reaching the real API.
                 for (let index = 0; index < 32; index++) {
-                    writer.putPushU32(0);
+                    let argumentValue = 0;
+                    if (probeProfile === 'one') {
+                        argumentValue = 1;
+                    }
+                    else if (probeProfile === 'readable') {
+                        argumentValue = argumentBuffer.toUInt32();
+                    }
+                    else if (probeProfile === 'mixed') {
+                        const values = [0, 1, argumentBuffer.toUInt32(),
+                                        0xffffffff];
+                        argumentValue = values[index % values.length];
+                    }
+                    writer.putPushU32(argumentValue);
                 }
                 writer.putCallAddress(callAddress);
                 const cleanupAddress = writer.code;

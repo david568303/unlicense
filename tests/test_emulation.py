@@ -12,6 +12,9 @@ from unicorn import (  # type: ignore
     Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_ERR_MAP)
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore
 
+from unlicense.application import (_create_probe_process,
+                                   _wait_for_event_with_progress)
+from unlicense.dump_utils import _resize_pe
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
 from unlicense.frida_exec import _call_with_timeout
 from unlicense.imports import ImportToCallSiteDict
@@ -29,16 +32,20 @@ class FakeProcessController(ProcessController):
         self.pages = pages
         self.exports = exports
         self.trace_results: Dict[int, int] = {}
+        self.trace_results_by_profile: Dict[str, Dict[int, int]] = {}
+        self.trace_stats_by_profile: Dict[str, Dict[str, Any]] = {}
         self.trace_timeout = 0
         self.active_probe = False
         self.active_probe_timeout = 0
+        self.active_probe_profiles: List[str] = []
         self.trace_wrappers: List[Dict[str, Any]] = []
         self.trace_error: Optional[Exception] = None
         self.trace_call_count = 0
         self.terminate_count = 0
+        self.module_addresses: Dict[int, Dict[str, Any]] = {}
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
-        return None
+        return self.module_addresses.get(address)
 
     def find_range_by_address(
             self,
@@ -78,18 +85,22 @@ class FakeProcessController(ProcessController):
             wrappers: List[Dict[str, Any]],
             timeout_ms: int,
             active_probe: bool = False,
-            active_probe_timeout_ms: int = 5000) -> Dict[int, int]:
+            active_probe_timeout_ms: int = 5000,
+            active_probe_profile: str = "zero") -> Dict[int, int]:
         self.trace_wrappers = wrappers
         self.trace_call_count += 1
         self.trace_timeout = timeout_ms
         self.active_probe = active_probe
         self.active_probe_timeout = active_probe_timeout_ms
-        self.last_wrapper_trace_stats = {
-            "activeProbes": 1 if active_probe else 0,
-        }
+        self.active_probe_profiles.append(active_probe_profile)
+        self.last_wrapper_trace_stats = self.trace_stats_by_profile.get(
+            active_probe_profile, {
+                "activeProbes": 1 if active_probe else 0,
+            })
         if self.trace_error is not None:
             raise self.trace_error
-        return self.trace_results
+        return self.trace_results_by_profile.get(active_probe_profile,
+                                                 self.trace_results)
 
     def allocate_process_memory(self, size: int, near: int) -> int:
         raise NotImplementedError
@@ -132,6 +143,58 @@ class HeapWrapperEmulationTests(unittest.TestCase):
                 _call_with_timeout(lambda: release.wait(), 1, "test RPC")
         finally:
             release.set()
+
+    def test_oep_wait_uses_full_budget_and_reports_timeout(self) -> None:
+        reached = threading.Event()
+        self.assertFalse(
+            _wait_for_event_with_progress(reached, 0.01, "test target", 0.005))
+        reached.set()
+        self.assertTrue(
+            _wait_for_event_with_progress(reached, 0.01, "test target", 0.005))
+
+    def test_sacrificial_startup_retries_with_isolated_callbacks(self) -> None:
+        first = FakeProcessController({}, {})
+        second = FakeProcessController({}, {})
+        launches = 0
+
+        def spawn(_path: Path, _ranges: List[MemoryRange], callback: Any,
+                  _timeout_ms: int) -> FakeProcessController:
+            nonlocal launches
+            launches += 1
+            if launches == 1:
+                return first
+            callback(0x500000, 0x501000, False)
+            return second
+
+        with patch("unlicense.application.frida_exec.spawn_and_instrument",
+                   side_effect=spawn):
+            controller, image_base = _create_probe_process(
+                Path("fixture.exe"), [MemoryRange(0x1000, 0x1000, "r-x")], 0.0,
+                1000, 1)
+
+        self.assertIs(second, controller)
+        self.assertEqual(0x500000, image_base)
+        self.assertEqual(1, first.terminate_count)
+        self.assertEqual(0, second.terminate_count)
+
+    def test_rebuilt_pe_preserves_original_bundle_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rebuilt = root / "rebuilt.exe"
+            original = root / "original.exe"
+            output = root / "output.exe"
+            rebuilt.write_bytes(b"R" * 80 + b"LIEF-GARBAGE")
+            original.write_bytes(b"O" * 100 + b"BUNDLED-DLL-DATA")
+
+            def fake_pe_size(path: str) -> int:
+                return 80 if Path(path) == rebuilt else 100
+
+            with patch("unlicense.dump_utils._get_pe_size",
+                       side_effect=fake_pe_size):
+                _resize_pe(str(rebuilt), str(output), str(original))
+
+            self.assertEqual(b"R" * 80 + b"BUNDLED-DLL-DATA",
+                             output.read_bytes())
 
     def test_native_trace_result_resolves_exception_wrapper(self) -> None:
         call_site = 0x401000
@@ -215,6 +278,69 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertFalse(main_controller.active_probe)
         self.assertEqual(0, main_controller.trace_timeout)
         self.assertEqual(1, probe_controller.terminate_count)
+
+    def test_active_trace_retries_with_readable_arguments_after_timeout(
+            self) -> None:
+        image_base = 0x400000
+        probe_image_base = 0x500000
+        call_site = 0x401000
+        wrapper = 0x402000
+        probe_call_site = 0x501000
+        probe_wrapper = 0x602000
+        main_api = 0x76002000
+        probe_api = 0x77003000
+
+        main_page = bytearray(0x1000)
+        main_page[0:5] = _relative_branch(0xe8, call_site, wrapper)
+        main_controller = FakeProcessController(
+            {
+                call_site: bytes(main_page),
+                wrapper: bytes([0xcc]) + bytes(0xfff),
+            }, {main_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+        probe_page = bytearray(0x1000)
+        probe_page[0:5] = _relative_branch(0xe8, probe_call_site,
+                                           probe_wrapper)
+        probe_controller = FakeProcessController(
+            {probe_call_site: bytes(probe_page)},
+            {probe_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+        probe_controller.trace_results_by_profile = {
+            "zero": {},
+            "readable": {
+                probe_call_site: probe_api
+            },
+        }
+        probe_controller.trace_stats_by_profile = {
+            "zero": {
+                "activeProbes": 1,
+                "activeProbeReturns": 0,
+                "activeProbeErrors": ["probe timed out"],
+            },
+            "readable": {
+                "activeProbes": 1,
+                "activeProbeReturns": 1,
+                "activeProbeErrors": [],
+            },
+        }
+
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+        diagnostics = _resolve_imports(
+            imports, {(call_site, 5, False, wrapper, None)}, None,
+            main_controller.exports, disassembler, main_controller, 0, True,
+            5000, image_base, lambda: (probe_controller, probe_image_base))
+
+        self.assertEqual([(call_site, 5, False)], imports[main_api])
+        self.assertEqual(["zero", "readable"],
+                         probe_controller.active_probe_profiles)
+        self.assertEqual(2, len(diagnostics[0]["probe_attempts"]))
+        self.assertNotIn("probe_error", diagnostics[0])
 
     def test_active_trace_restarts_probe_after_sacrificial_crash(self) -> None:
         image_base = 0x400000
@@ -357,6 +483,36 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual(1, factory_calls)
         self.assertEqual(2, probe_controller.trace_call_count)
         self.assertEqual(1, probe_controller.terminate_count)
+
+    def test_internal_tail_call_is_not_treated_as_unresolved_import(
+            self) -> None:
+        call_site = 0x1000
+        wrapper = 0x2000
+        call_page = bytearray(0x1000)
+        call_page[0] = 0x90
+        call_page[1:6] = _relative_branch(0xe9, call_site + 1, wrapper)
+        wrapper_page = bytes([0xc3]) + bytes(0xfff)
+        controller = FakeProcessController(
+            {
+                call_site: bytes(call_page),
+                wrapper: wrapper_page,
+            }, {})
+        controller.module_addresses[wrapper] = {
+            "name": "fixture.exe",
+            "base": "0x1000",
+            "size": 0x2000,
+        }
+
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+        diagnostics = _resolve_imports(imports,
+                                       {(call_site, 5, True, wrapper, None)},
+                                       None, {}, disassembler, controller)
+
+        self.assertEqual({}, imports)
+        self.assertEqual("internal_call", diagnostics[0]["resolution_method"])
+        self.assertTrue(diagnostics[0]["emulation"]["returned_without_export"])
 
     def test_synthetic_heap_search_is_bounded(self) -> None:
         controller = FakeProcessController({}, {})

@@ -20,6 +20,12 @@
 - Add a bounded, configurable timeout for each active wrapper probe.
 - Add host-side hard deadlines to OEP setup and wrapper-tracing RPCs so a
   stalled Frida agent cannot block the controller indefinitely.
+- Add bounded sacrificial-process startup retries with visible progress and use
+  the requested OEP timeout instead of an unrelated fixed ten-second limit.
+- Retry unresolved native wrappers with zero, readable-pointer, and mixed
+  argument profiles.
+- Add a bounded JSON post-build validation report for the OEP, executable entry
+  section, import directories, resources, and bundle overlay.
 
 ### Fixed
 - Skip the final imported API during active wrapper probing so synthetic
@@ -33,6 +39,16 @@
 - Simulate RTL string and boundary-descriptor cleanup calls used as wrapper
   noise, and report INT3-based wrappers without treating them as resolved.
 - Avoid printing raw ANSI color sequences in the Windows 7 console.
+- Re-arm OEP pages after `NtProtectVirtualMemory` completes and detect any
+  protection range that overlaps the expected code, fixing missed OEP events
+  in subsequent protected instances.
+- Stop the EXE OEP-discovery exception handler from swallowing faults after the
+  OEP is found, allowing INT3/access-violation import wrappers to reach their
+  own Themida exception handlers during native probing.
+- Recognize wrapper candidates that return without reaching an export as
+  internal calls instead of corrupting them into fake imports.
+- Use separate Scylla input/output paths and preserve the original PE overlay
+  after LIEF rebuilding so appended bundle payloads are not truncated.
 
 ## [0.4.0] - 2023-08-14
 ### Added

@@ -78,8 +78,10 @@ def fix_and_dump_pe(
         active_probe_timeout, image_base, probe_process_factory)
     LOG.info("Imports resolved: %d", len(api_to_calls))
 
-    unresolved_count = sum(1 for wrapper in wrapper_diagnostics
-                           if wrapper.get("resolved_address") is None)
+    unresolved_count = sum(
+        1 for wrapper in wrapper_diagnostics
+        if wrapper.get("resolved_address") is None
+        and wrapper.get("resolution_method") != "internal_call")
     if unresolved_count > 0:
         LOG.warning("Unresolved import wrappers: %d/%d. The dump may not run.",
                     unresolved_count, len(wrapper_diagnostics))
@@ -212,6 +214,12 @@ def _resolve_imports(
             "wrapper_bytes": diagnostic_bytes(wrapper_addr, 256),
             "resolved_address": None,
         }
+        try:
+            wrapper_module = process_controller.find_module_by_address(
+                wrapper_addr)
+            record["wrapper_module"] = wrapper_module
+        except Exception as error:
+            record["wrapper_module_error"] = str(error)
         diagnostics.append(record)
 
         resolved_addr = resolved_wrappers.get(wrapper_addr)
@@ -267,8 +275,20 @@ def _resolve_imports(
                 (call_addr, call_size, instr_was_jmp))
             record_resolution(record, "emulation", resolved_addr)
         else:
-            record["resolution_method"] = "unresolved"
-            problematic_wrappers.add(wrapper_addr)
+            wrapper_module = record.get("wrapper_module")
+            wrapper_module_name = (wrapper_module.get("name") if isinstance(
+                wrapper_module, dict) else None)
+            if (emulation_diagnostic.get("returned_without_export")
+                    and isinstance(wrapper_module_name, str)
+                    and wrapper_module_name.lower()
+                    == process_controller.main_module_name.lower()):
+                LOG.debug(
+                    "Ignoring internal call misidentified as wrapper: "
+                    "%s -> %s", hex(call_addr), hex(wrapper_addr))
+                record["resolution_method"] = "internal_call"
+            else:
+                record["resolution_method"] = "unresolved"
+                problematic_wrappers.add(wrapper_addr)
 
     def apply_traced_imports(records: List[Dict[str, Any]],
                              traced_imports: Dict[int,
@@ -286,7 +306,8 @@ def _resolve_imports(
 
     unresolved_records = sorted(
         (record
-         for record in diagnostics if record.get("resolved_address") is None),
+         for record in diagnostics if record.get("resolved_address") is None
+         and record.get("resolution_method") != "internal_call"),
         key=lambda record: int(record["call_address"], 16))
     if (native_trace_timeout > 0 and active_wrapper_probe
             and unresolved_records):
@@ -311,7 +332,8 @@ def _resolve_imports(
 
     unresolved_records = sorted(
         (record
-         for record in diagnostics if record.get("resolved_address") is None),
+         for record in diagnostics if record.get("resolved_address") is None
+         and record.get("resolution_method") != "internal_call"),
         key=lambda record: int(record["call_address"], 16))
     if (active_wrapper_probe and unresolved_records
             and arch != Architecture.X86_32):
@@ -346,26 +368,48 @@ def _resolve_imports(
                                 probe_controller)
                         if not probe_requests:
                             continue
-                        LOG.warning(
-                            "Actively probing wrapper %d/%d in reusable "
-                            "sacrificial target PID=%d (timeout=%d ms); the "
-                            "dump target remains untouched", index,
-                            len(unresolved_records), probe_controller.pid,
-                            probe_timeout)
-                        probe_results = probe_controller.trace_wrapped_imports(
-                            probe_requests, 0, True, probe_timeout)
-                        stats = probe_controller.last_wrapper_trace_stats
-                        record["probe_trace_stats"] = stats
-                        if stats is not None:
-                            probe_errors = stats.get("activeProbeErrors", [])
-                            if probe_errors:
-                                record["probe_error"] = "; ".join(
-                                    str(error) for error in probe_errors)
-                        traced_imports = _translate_probe_results(
-                            probe_results, probe_to_main_calls,
-                            probe_controller, process_controller)
-                        apply_traced_imports([record], traced_imports,
-                                             "sacrificial_native_trace")
+                        profiles = ("zero", "readable", "mixed")
+                        probe_attempts: List[Dict[str, Any]] = []
+                        record["probe_attempts"] = probe_attempts
+                        for profile_index, profile in enumerate(profiles, 1):
+                            LOG.warning(
+                                "Actively probing wrapper %d/%d with profile "
+                                "%s (%d/%d) in reusable sacrificial target "
+                                "PID=%d (timeout=%d ms); the dump target "
+                                "remains untouched", index,
+                                len(unresolved_records), profile,
+                                profile_index, len(profiles),
+                                probe_controller.pid, probe_timeout)
+                            probe_results = \
+                                probe_controller.trace_wrapped_imports(
+                                    probe_requests, 0, True, probe_timeout,
+                                    profile)
+                            stats = probe_controller.last_wrapper_trace_stats
+                            record["probe_trace_stats"] = stats
+                            probe_attempts.append({
+                                "profile": profile,
+                                "stats": stats,
+                            })
+                            if stats is not None:
+                                probe_errors = stats.get(
+                                    "activeProbeErrors", [])
+                                if probe_errors:
+                                    record["probe_error"] = "; ".join(
+                                        str(error) for error in probe_errors)
+                            traced_imports = _translate_probe_results(
+                                probe_results, probe_to_main_calls,
+                                probe_controller, process_controller)
+                            apply_traced_imports([record], traced_imports,
+                                                 "sacrificial_native_trace")
+                            if record.get("resolved_address") is not None:
+                                record.pop("probe_error", None)
+                                break
+                            if (stats is not None
+                                    and stats.get("activeProbeReturns", 0) > 0
+                                    and not stats.get("activeProbeErrors")):
+                                record["probe_error"] = \
+                                    "probe returned without reaching an export"
+                                break
                     except Exception as error:
                         record["probe_error"] = str(error)
                         LOG.warning("Sacrificial wrapper %d/%d failed: %s",

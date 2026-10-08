@@ -79,10 +79,11 @@ for the next wrapper. Successful wrapper resolutions are committed one at a
 time, so a later crash cannot erase earlier results.
 
 Inside the sacrificial process, the probe supplies synthetic zero-filled
-arguments and temporarily places a jump to controlled stack cleanup after each
-probed CALL. It restores the original bytes immediately afterward. Once the
-wrapper reaches its final Windows API, the tracer records the address and skips
-the API body instead of invoking it with synthetic arguments.
+arguments first, then retries unresolved wrappers with readable-pointer and
+mixed-value profiles. It temporarily places a jump to controlled stack cleanup
+after each probed CALL and restores the original bytes immediately afterward.
+Once the wrapper reaches its final Windows API, the tracer records the address
+and skips the API body instead of invoking it with synthetic arguments.
 Intermediate APIs used internally by the wrapper still execute and may have
 side effects, so the probe remains experimental.
 Use this option only in a disposable, isolated VM snapshot. It currently
@@ -93,8 +94,17 @@ by default so a non-returning wrapper does not stall the whole dump. Adjust
 `--active_probe_timeout` between 100 and 60000 milliseconds for unusually slow
 wrappers; the default is 5000 milliseconds. Host-side deadlines also protect
 OEP setup, trace setup, and trace collection if the injected agent itself stops
-replying. The diagnostic JSON records those errors and the last 64 exports
+replying. Sacrificial startup uses the main `--timeout` budget, reports progress
+every five seconds, and retries twice by default; use
+`--active_probe_startup_retries=0` to disable those retries. The diagnostic JSON
+records each argument-profile attempt, its errors, and the last 64 exports
 reached by the active probe.
+
+The rebuilt output preserves the original executable overlay, which is
+important for single-file bundles that append DLLs or metadata after the PE
+sections. Unlicense also writes `unpacked_<target>.validation.json` beside the
+dump. This bounded post-build check records the recovered entry point, section
+layout, import/IAT directories, resource preservation, and overlay size.
 
 Unlicense is not a remote dumper: Frida starts the target locally and Scylla
 opens that local process ID.  Consequently, running Unlicense on Windows 10/11
@@ -186,6 +196,9 @@ FLAGS
     --active_probe_timeout=ACTIVE_PROBE_TIMEOUT
         Type: int
         Default: 5000
+    --active_probe_startup_retries=ACTIVE_PROBE_STARTUP_RETRIES
+        Type: int
+        Default: 2
 
 NOTES
     You can also use flags syntax for POSITIONAL ARGUMENTS
