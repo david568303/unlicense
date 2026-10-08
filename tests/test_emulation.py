@@ -13,7 +13,7 @@ from unicorn import (  # type: ignore
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore
 
 from unlicense.application import (_create_primary_process,
-                                   _create_probe_process,
+                                   _create_probe_process, _normalize_cli_bool,
                                    _wait_for_event_with_progress)
 from unlicense.dump_utils import _resize_pe
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
@@ -155,6 +155,14 @@ def _relative_branch(opcode: int, instruction_address: int,
 
 
 class HeapWrapperEmulationTests(unittest.TestCase):
+
+    def test_cli_boolean_normalization_is_case_insensitive(self) -> None:
+        for value in (False, 0, "false", "False", "FALSE", "no", "off"):
+            self.assertFalse(_normalize_cli_bool(value, "test_flag"))
+        for value in (True, 1, "true", "True", "TRUE", "yes", "on"):
+            self.assertTrue(_normalize_cli_bool(value, "test_flag"))
+        with self.assertRaisesRegex(ValueError, "--test_flag expects"):
+            _normalize_cli_bool("not-a-boolean", "test_flag")
 
     def test_blocking_frida_rpc_has_host_side_deadline(self) -> None:
         release = threading.Event()
@@ -357,8 +365,42 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertFalse(probe_controller.active_probe)
         self.assertEqual(7000, probe_controller.trace_timeout)
         self.assertFalse(main_controller.active_probe)
-        self.assertEqual(0, main_controller.trace_timeout)
+        self.assertEqual(250, main_controller.trace_timeout)
+        self.assertEqual(1, main_controller.trace_call_count)
         self.assertEqual(1, probe_controller.terminate_count)
+
+    def test_explicit_native_trace_is_not_suppressed_by_active_probe(
+            self) -> None:
+        call_site = 0x401000
+        wrapper = 0x402000
+        target_api = 0x77003000
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, wrapper)
+        controller = FakeProcessController(
+            {
+                call_site: bytes(call_page),
+                wrapper: bytes([0xcc]) + bytes(0xfff),
+            }, {target_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+        controller.trace_results = {call_site: target_api}
+        probe_factory = Mock()
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        diagnostics = _resolve_imports(imports,
+                                       {(call_site, 5, False, wrapper, None)},
+                                       None, controller.exports, disassembler,
+                                       controller, 60000, True, 5000, 0x400000,
+                                       probe_factory)
+
+        self.assertEqual([(call_site, 5, False)], imports[target_api])
+        self.assertEqual("native_trace", diagnostics[0]["resolution_method"])
+        self.assertEqual(60000, controller.trace_timeout)
+        self.assertEqual(1, controller.trace_call_count)
+        probe_factory.assert_not_called()
 
     def test_natural_trace_does_not_run_synthetic_argument_profiles(
             self) -> None:

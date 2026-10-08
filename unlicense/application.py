@@ -23,6 +23,23 @@ def main() -> None:
     fire.Fire(run_unlicense)
 
 
+def _normalize_cli_bool(value: Any, option_name: str) -> bool:
+    """Normalize booleans because Fire 0.4 treats lowercase values as text."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError(
+        f"--{option_name} expects true/false, yes/no, on/off, or 1/0; "
+        f"received {value!r}")
+
+
 def run_unlicense(
     pe_to_dump: str,
     verbose: bool = False,
@@ -41,7 +58,21 @@ def run_unlicense(
     """
     Unpack executables protected with Themida/WinLicense 2.x and 3.x
     """
+    # Python Fire 0.4 only recognizes title-cased boolean literals.  Values
+    # such as `--active_wrapper_probe=false` otherwise arrive as the non-empty
+    # string "false" and are truthy, which silently enables the option.  Parse
+    # every CLI boolean explicitly before it can affect control flow.
+    verbose = _normalize_cli_bool(verbose, "verbose")
+    pause_on_oep = _normalize_cli_bool(pause_on_oep, "pause_on_oep")
+    no_imports = _normalize_cli_bool(no_imports, "no_imports")
+    active_wrapper_probe = _normalize_cli_bool(active_wrapper_probe,
+                                               "active_wrapper_probe")
     setup_logger(LOG, verbose)
+    LOG.info(
+        "Trace configuration: native=%d ms, sacrificial=%s, "
+        "sacrificial_window=%d ms", native_trace_timeout,
+        "enabled" if active_wrapper_probe else "disabled",
+        active_probe_timeout)
 
     # Make sure child processes won't try to run as administrator
     _force_run_as_invoker()

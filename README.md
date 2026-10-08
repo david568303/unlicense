@@ -57,6 +57,13 @@ The native fallback is disabled by default because it lets the target execute
 normally for the requested number of milliseconds. Use it only in an isolated
 test system where target-side effects are acceptable.
 
+`--native_trace_timeout` and `--active_wrapper_probe` may be combined. The
+explicit native-trace window always runs first on the dump target; a
+sacrificial instance is started afterwards only for wrappers that remain
+unresolved. The native timeout is never discarded merely because the
+sacrificial fallback is enabled. Boolean values are case-insensitive, so both
+`--active_wrapper_probe=false` and `--active_wrapper_probe=False` disable it.
+
 If tracing the dump target is undesirable, 32-bit targets can instead trace
 the normal startup path in one sacrificial target instance:
 

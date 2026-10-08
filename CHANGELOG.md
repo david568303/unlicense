@@ -19,6 +19,12 @@
   section, import directories, resources, and bundle overlay.
 
 ### Fixed
+- Normalize all CLI boolean values independently of capitalization. With Fire
+  0.4, a value such as `--active_wrapper_probe=false` previously arrived as a
+  truthy string and unexpectedly enabled the sacrificial trace.
+- Always honor an explicit `--native_trace_timeout` when sacrificial tracing is
+  also enabled. Native tracing now runs first and the clone is only used for
+  wrappers that remain unresolved.
 - Treat export control-flow loops as bounded, deterministic hash input instead
   of emitting per-function abort warnings, retain every export involved in a
   fingerprint collision, and defer ambiguous matches to emulation/native

@@ -383,11 +383,7 @@ def _resolve_imports(
          if record.get("resolved_address") is None and record.get(
              "resolution_method") not in NON_IMPORT_RESOLUTION_METHODS),
         key=lambda record: int(record["call_address"], 16))
-    if (native_trace_timeout > 0 and active_wrapper_probe
-            and unresolved_records):
-        LOG.warning("Ignoring --native_trace_timeout while active probing is "
-                    "enabled so the dump target remains blocked and intact")
-    elif native_trace_timeout > 0 and unresolved_records:
+    if native_trace_timeout > 0 and unresolved_records:
         trace_requests = _build_trace_requests(unresolved_records)
         LOG.warning(
             "Running the dump target for %d ms to trace %d native "
