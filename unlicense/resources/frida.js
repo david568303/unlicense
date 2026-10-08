@@ -348,6 +348,42 @@ rpc.exports = {
         });
         return moduleNames;
     },
+    enumeratePeCandidates: function () {
+        const candidates = [];
+        const seen = new Set();
+        ['r--', 'r-x', 'rw-', 'rwx'].forEach(protection => {
+            Process.enumerateRangesSync(protection).forEach(range => {
+                const baseString = range.base.toString();
+                if (seen.has(baseString) || range.size < 0x40) {
+                    return;
+                }
+                seen.add(baseString);
+
+                try {
+                    if (range.base.readU16() !== 0x5a4d) {
+                        return;
+                    }
+                    const peOffset = range.base.add(0x3c).readU32();
+                    if (peOffset > 0x1000 || range.base.add(peOffset).readU32() !== 0x4550) {
+                        return;
+                    }
+                    const module = Process.findModuleByAddress(range.base);
+                    candidates.push({
+                        base: baseString,
+                        size: range.size,
+                        protection: range.protection,
+                        module: module === null ? null : module.name,
+                        path: module === null ? null : module.path
+                    });
+                }
+                catch (_error) {
+                    // A range can disappear or change protection while it is
+                    // being inspected. Diagnostics should remain best-effort.
+                }
+            });
+        });
+        return candidates;
+    },
     enumerateModuleRanges: function (moduleName) {
         let ranges = Process.enumerateRangesSync("r--");
         return ranges.filter(range => {

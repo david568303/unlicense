@@ -29,6 +29,7 @@ def run_unlicense(
     force_oep: Optional[int] = None,
     target_version: Optional[int] = None,
     timeout: int = 10,
+    diagnostic_output: Optional[str] = None,
 ) -> None:
     """
     Unpack executables protected with Themida/WinLicense 2.x and 3.x
@@ -117,8 +118,11 @@ def run_unlicense(
         elif target_version == 2:
             winlicense2.fix_and_dump_pe(process_controller, pe_to_dump,
                                         dumped_image_base, dumped_oep,
-                                        text_section_range)
+                                        text_section_range, diagnostic_output)
         elif target_version == 3:
+            if diagnostic_output is not None:
+                LOG.warning(
+                    "Diagnostic reports currently cover Themida 2.x only")
             winlicense3.fix_and_dump_pe(process_controller, pe_to_dump,
                                         dumped_image_base, dumped_oep,
                                         section_ranges, text_section_range)

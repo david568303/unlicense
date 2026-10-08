@@ -1,0 +1,168 @@
+import json
+import struct
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from unlicense.emulation import resolve_wrapped_api
+from unlicense.process_control import (Architecture, MemoryRange,
+                                       ProcessController,
+                                       ReadProcessMemoryError)
+from unlicense.winlicense2 import _write_diagnostic_report
+
+
+class FakeProcessController(ProcessController):
+
+    def __init__(self, pages: Dict[int, bytes], exports: Dict[int, Dict[str,
+                                                                        Any]]):
+        super().__init__(1, "fixture.exe", Architecture.X86_32, 4, 0x1000)
+        self.pages = pages
+        self.exports = exports
+
+    def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
+        return None
+
+    def find_range_by_address(
+            self,
+            address: int,
+            include_data: bool = False) -> Optional[MemoryRange]:
+        page_base = address - address % self.page_size
+        page = self.pages.get(page_base)
+        if page is None:
+            return None
+        return MemoryRange(page_base, len(page), "r-x",
+                           page if include_data else None)
+
+    def find_export_by_name(self, module_name: str,
+                            export_name: str) -> Optional[int]:
+        return None
+
+    def enumerate_modules(self) -> List[str]:
+        return ["fixture.exe", "ntdll.dll", "kernel32.dll"]
+
+    def enumerate_module_ranges(
+            self,
+            module_name: str,
+            include_data: bool = False) -> List[MemoryRange]:
+        return []
+
+    def enumerate_exported_functions(self,
+                                     update_cache: bool = False
+                                     ) -> Dict[int, Dict[str, Any]]:
+        return self.exports
+
+    def allocate_process_memory(self, size: int, near: int) -> int:
+        raise NotImplementedError
+
+    def query_memory_protection(self, address: int) -> str:
+        raise NotImplementedError
+
+    def set_memory_protection(self, address: int, size: int,
+                              protection: str) -> bool:
+        raise NotImplementedError
+
+    def read_process_memory(self, address: int, size: int) -> bytes:
+        page_base = address - address % self.page_size
+        page = self.pages.get(page_base)
+        page_offset = address - page_base
+        if page is None or page_offset + size > len(page):
+            raise ReadProcessMemoryError
+        return page[page_offset:page_offset + size]
+
+    def write_process_memory(self, address: int, data: List[int]) -> None:
+        raise NotImplementedError
+
+    def terminate_process(self) -> None:
+        return None
+
+
+def _relative_branch(opcode: int, instruction_address: int,
+                     destination: int) -> bytes:
+    displacement = destination - (instruction_address + 5)
+    return bytes([opcode]) + struct.pack("<i", displacement)
+
+
+class HeapWrapperEmulationTests(unittest.TestCase):
+
+    def test_rtl_allocate_heap_is_simulated_before_target_api(self) -> None:
+        call_site = 0x401000
+        wrapper = 0x402000
+        rtl_allocate_heap = 0x77001000
+        target_api = 0x77002000
+
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, wrapper)
+
+        wrapper_page = bytearray(0x1000)
+        wrapper_code = bytearray()
+        wrapper_code += b"\x68\x20\x00\x00\x00"  # push 0x20 (size)
+        wrapper_code += b"\x6a\x00"  # push 0 (flags)
+        wrapper_code += b"\x6a\x01"  # push 1 (synthetic heap handle)
+        heap_call = wrapper + len(wrapper_code)
+        wrapper_code += _relative_branch(0xe8, heap_call, rtl_allocate_heap)
+        target_jump = wrapper + len(wrapper_code)
+        wrapper_code += _relative_branch(0xe9, target_jump, target_api)
+        wrapper_page[0:len(wrapper_code)] = wrapper_code
+
+        pages = {
+            call_site: bytes(call_page),
+            wrapper: bytes(wrapper_page),
+            rtl_allocate_heap: bytes([0xc3]) + bytes(0xfff),
+            target_api: bytes([0xc3]) + bytes(0xfff),
+        }
+        exports = {
+            rtl_allocate_heap: {
+                "name": "RtlAllocateHeap",
+                "address": hex(rtl_allocate_heap),
+            },
+            target_api: {
+                "name": "TargetApi",
+                "address": hex(target_api),
+            },
+        }
+        controller = FakeProcessController(pages, exports)
+        diagnostic: Dict[str, Any] = {}
+
+        resolved = resolve_wrapped_api(call_site, controller, call_site + 5,
+                                       diagnostic)
+
+        self.assertEqual(target_api, resolved)
+        self.assertNotIn("error", diagnostic)
+        self.assertEqual("RtlAllocateHeap",
+                         diagnostic["simulated_apis"][0]["name"])
+        self.assertEqual(0x20,
+                         diagnostic["simulated_apis"][0]["requested_size"])
+
+    def test_compact_diagnostic_report_is_serializable(self) -> None:
+        target_api = 0x77002000
+        controller = FakeProcessController(
+            {},
+            {target_api: {
+                "name": "TargetApi",
+                "address": hex(target_api),
+            }})
+        calls = {target_api: [(0x401000, 5, False)]}
+        wrappers = [{
+            "call_address": "0x401000",
+            "wrapper_address": "0x402000",
+            "wrapper_bytes": "90e900000000",
+            "resolved_address": hex(target_api),
+        }]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_path = Path(temporary_directory) / "diagnostic.json"
+            _write_diagnostic_report(str(report_path), "fixture.exe", 0x400000,
+                                     0x401000,
+                                     MemoryRange(0x401000, 0x1000, "r-x"), 0,
+                                     calls, wrappers, controller)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("fixture.exe", report["target_name"])
+        self.assertEqual(1, report["potential_wrapper_count"])
+        self.assertEqual("TargetApi",
+                         report["resolved_imports"][0]["export"]["name"])
+
+
+if __name__ == "__main__":
+    unittest.main()

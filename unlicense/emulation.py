@@ -1,6 +1,6 @@
 import logging
 import struct
-from typing import Callable, Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Any, Optional
 
 from unicorn import (  # type: ignore
     Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_PROT_READ,
@@ -8,19 +8,22 @@ from unicorn import (  # type: ignore
 from unicorn.x86_const import (  # type: ignore
     UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_EIP, UC_X86_REG_RSP,
     UC_X86_REG_RBP, UC_X86_REG_RIP, UC_X86_REG_MSR, UC_X86_REG_EAX,
-    UC_X86_REG_RAX)
+    UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8,
+    UC_X86_REG_R9)
 
 from .dump_utils import pointer_size_to_fmt
 from .process_control import ProcessController, Architecture, ReadProcessMemoryError
 
 STACK_MAGIC_RET_ADDR = 0xdeadbeef
+MAX_EMULATED_HEAP_ALLOCATION = 64 * 1024 * 1024
 LOG = logging.getLogger(__name__)
 
 
 def resolve_wrapped_api(
         wrapper_start_addr: int,
         process_controller: ProcessController,
-        expected_ret_addr: Optional[int] = None) -> Optional[int]:
+        expected_ret_addr: Optional[int] = None,
+        diagnostic: Optional[Dict[str, Any]] = None) -> Optional[int]:
     arch = process_controller.architecture
     if arch == Architecture.X86_32:
         uc_arch = UC_ARCH_X86
@@ -42,6 +45,17 @@ def resolve_wrapped_api(
         setup_teb = _setup_teb_x64
     else:
         raise NotImplementedError(f"Architecture '{arch}' isn't supported")
+
+    if diagnostic is None:
+        diagnostic = {}
+    diagnostic.update({
+        "start_address":
+        hex(wrapper_start_addr),
+        "expected_return_address":
+        None if expected_ret_addr is None else hex(expected_ret_addr),
+        "mapped_pages": [],
+        "simulated_apis": [],
+    })
 
     uc = Uc(uc_arch, uc_mode)
     try:
@@ -69,18 +83,27 @@ def resolve_wrapped_api(
             stop_on_ret_addr = STACK_MAGIC_RET_ADDR
         else:
             stop_on_ret_addr = expected_ret_addr
+        emulation_context = {
+            "process_controller": process_controller,
+            "stop_on_ret_addr": stop_on_ret_addr,
+            "diagnostic": diagnostic,
+            "heap_next":
+            0x30000000 if arch == Architecture.X86_32 else 0x20000000000,
+            "heap_allocations": {},
+        }
         uc.hook_add(UC_HOOK_MEM_UNMAPPED,
                     _unicorn_hook_unmapped,
-                    user_data=process_controller)
+                    user_data=emulation_context)
         uc.hook_add(UC_HOOK_BLOCK,
                     _unicorn_hook_block,
-                    user_data=(process_controller, stop_on_ret_addr))
+                    user_data=emulation_context)
 
         uc.emu_start(wrapper_start_addr, wrapper_start_addr + 1024)
 
         # Read and return PC
         pc = uc.reg_read(result_register)
         assert isinstance(pc, int)
+        diagnostic["resolved_address"] = hex(pc)
 
         return pc
     except UcError as e:
@@ -94,6 +117,12 @@ def resolve_wrapped_api(
         LOG.debug("PC=%s", hex(pc))
         LOG.debug("SP=%s", hex(sp))
         LOG.debug("BP=%s", hex(bp))
+        diagnostic.update({
+            "error": str(e),
+            "pc": hex(pc),
+            "sp": hex(sp),
+            "bp": hex(bp),
+        })
         return None
 
 
@@ -126,10 +155,14 @@ def _setup_teb_x64(uc: Uc, process_info: ProcessController) -> None:
 
 
 def _unicorn_hook_unmapped(uc: Uc, _access: Any, address: int, _size: int,
-                           _value: int,
-                           process_controller: ProcessController) -> bool:
+                           _value: int, emulation_context: Dict[str,
+                                                                Any]) -> bool:
+    process_controller: ProcessController = emulation_context[
+        "process_controller"]
+    diagnostic: Dict[str, Any] = emulation_context["diagnostic"]
     LOG.debug("Unmapped memory at %s", hex(address))
     if address == 0:
+        diagnostic["unmapped_failure"] = hex(address)
         return False
 
     page_size = process_controller.page_size
@@ -141,6 +174,10 @@ def _unicorn_hook_unmapped(uc: Uc, _access: Any, address: int, _size: int,
         uc.mem_write(aligned_addr, in_process_data)
         LOG.debug("Mapped %d bytes at %s", len(in_process_data),
                   hex(aligned_addr))
+        diagnostic["mapped_pages"].append({
+            "address": hex(aligned_addr),
+            "size": len(in_process_data),
+        })
         return True
     except UcError as e:
         LOG.error("ERROR: %s", str(e))
@@ -149,15 +186,22 @@ def _unicorn_hook_unmapped(uc: Uc, _access: Any, address: int, _size: int,
         # Log this error as debug as it's expected to happen in cases where we
         # reach the end of the IAT.
         LOG.debug("ERROR: %s", str(e))
+        diagnostic["unmapped_failure"] = hex(address)
+        diagnostic["memory_error"] = str(e)
         return False
     except Exception as e:
         LOG.error("ERROR: %s", str(e))
+        diagnostic["unmapped_failure"] = hex(address)
+        diagnostic["memory_error"] = str(e)
         return False
 
 
 def _unicorn_hook_block(uc: Uc, address: int, _size: int,
-                        user_data: Tuple[ProcessController, int]) -> None:
-    process_controller, stop_on_ret_addr = user_data
+                        emulation_context: Dict[str, Any]) -> None:
+    process_controller: ProcessController = emulation_context[
+        "process_controller"]
+    stop_on_ret_addr: int = emulation_context["stop_on_ret_addr"]
+    diagnostic: Dict[str, Any] = emulation_context["diagnostic"]
     ptr_size = process_controller.pointer_size
     arch = process_controller.architecture
     if arch == Architecture.X86_32:
@@ -194,12 +238,14 @@ def _unicorn_hook_block(uc: Uc, address: int, _size: int,
             uc.reg_write(result_register, address)
             uc.emu_stop()
             return
-        if _is_bogus_api(api_name):
+        if _is_simulated_api(api_name):
             # Note: Starting with Themida 3.1.4.0, wrappers call some useless
-            # APIs to fool emulation-based unwrappers
-            LOG.debug("Reached bogus API call, skipping")
-            # "Simulate" bogus call
-            result, arg_count = _simulate_bogus_api(api_name)
+            # APIs to fool emulation-based unwrappers. Some Themida 2.x
+            # wrappers also use heap APIs while computing the real target.
+            LOG.debug("Reached auxiliary API call, simulating")
+            result, arg_count, api_details = _simulate_api(
+                api_name, uc, sp, arch, emulation_context)
+            diagnostic["simulated_apis"].append(api_details)
             # Set result
             uc.reg_write(result_register, result)
 
@@ -223,13 +269,117 @@ def _is_no_return_api(api_name: str) -> bool:
     return api_name in NO_RETURN_APIS
 
 
-def _is_bogus_api(api_name: str) -> bool:
-    BOGUS_APIS = ["Sleep"]
-    return api_name in BOGUS_APIS
+def _is_simulated_api(api_name: str) -> bool:
+    simulated_apis = [
+        "Sleep", "GetProcessHeap", "RtlGetProcessHeap", "HeapAlloc",
+        "RtlAllocateHeap", "HeapFree", "RtlFreeHeap", "HeapReAlloc",
+        "RtlReAllocateHeap", "HeapSize", "RtlSizeHeap"
+    ]
+    return api_name in simulated_apis
 
 
-def _simulate_bogus_api(api_name: str) -> Tuple[int, int]:
-    BOGUS_API_MAP: Dict[str, Tuple[int, int]] = {
-        "Sleep": (0, 1),
-    }
-    return BOGUS_API_MAP[api_name]
+def _simulate_api(
+        api_name: str, uc: Uc, sp: int, arch: Architecture,
+        emulation_context: Dict[str, Any]) -> Tuple[int, int, Dict[str, Any]]:
+    details: Dict[str, Any] = {"name": api_name}
+
+    if api_name == "Sleep":
+        return 0, 1, details
+
+    if api_name in ["GetProcessHeap", "RtlGetProcessHeap"]:
+        result = 0x12340000
+        details["result"] = hex(result)
+        return result, 0, details
+
+    if api_name in ["HeapAlloc", "RtlAllocateHeap"]:
+        flags = _read_api_argument(uc, sp, arch, 1)
+        requested_size = _read_api_argument(uc, sp, arch, 2)
+        result = _allocate_emulated_heap(uc, requested_size, emulation_context)
+        details.update({
+            "flags": hex(flags),
+            "requested_size": requested_size,
+            "result": hex(result),
+        })
+        return result, 3, details
+
+    if api_name in ["HeapFree", "RtlFreeHeap"]:
+        allocation = _read_api_argument(uc, sp, arch, 2)
+        details["allocation"] = hex(allocation)
+        return 1, 3, details
+
+    if api_name in ["HeapReAlloc", "RtlReAllocateHeap"]:
+        old_allocation = _read_api_argument(uc, sp, arch, 2)
+        requested_size = _read_api_argument(uc, sp, arch, 3)
+        result = _allocate_emulated_heap(uc, requested_size, emulation_context)
+        old_size = emulation_context["heap_allocations"].get(old_allocation, 0)
+        copy_size = min(old_size, requested_size)
+        if copy_size > 0:
+            try:
+                old_data = uc.mem_read(old_allocation, copy_size)
+                uc.mem_write(result, bytes(old_data))
+            except UcError:
+                pass
+        details.update({
+            "old_allocation": hex(old_allocation),
+            "requested_size": requested_size,
+            "result": hex(result),
+        })
+        return result, 4, details
+
+    if api_name in ["HeapSize", "RtlSizeHeap"]:
+        allocation = _read_api_argument(uc, sp, arch, 2)
+        result = emulation_context["heap_allocations"].get(allocation, 0)
+        details.update({
+            "allocation": hex(allocation),
+            "result": result,
+        })
+        return result, 3, details
+
+    raise NotImplementedError(f"No simulator for API '{api_name}'")
+
+
+def _read_api_argument(uc: Uc, sp: int, arch: Architecture, index: int) -> int:
+    if arch == Architecture.X86_32:
+        argument_data = uc.mem_read(sp + 4 * (index + 1), 4)
+        return struct.unpack("<I", argument_data)[0]
+
+    if arch == Architecture.X86_64:
+        argument_registers = [
+            UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9
+        ]
+        if index < len(argument_registers):
+            value = uc.reg_read(argument_registers[index])
+            assert isinstance(value, int)
+            return value
+
+        # Return address + 32 bytes of caller-provided shadow space.
+        argument_data = uc.mem_read(sp + 0x28 + 8 * (index - 4), 8)
+        return struct.unpack("<Q", argument_data)[0]
+
+    raise NotImplementedError(f"Architecture '{arch}' isn't supported")
+
+
+def _allocate_emulated_heap(uc: Uc, requested_size: int,
+                            emulation_context: Dict[str, Any]) -> int:
+    process_controller: ProcessController = emulation_context[
+        "process_controller"]
+    page_size = process_controller.page_size
+    allocation_size = max(1, min(requested_size, MAX_EMULATED_HEAP_ALLOCATION))
+    mapped_size = ((allocation_size + page_size - 1) // page_size) * page_size
+    candidate = emulation_context["heap_next"]
+    candidate -= candidate % page_size
+
+    # Avoid ranges from the real process and previous synthetic allocations.
+    while True:
+        if process_controller.find_range_by_address(candidate) is not None:
+            candidate += mapped_size + page_size
+            continue
+        try:
+            uc.mem_map(candidate, mapped_size, UC_PROT_READ | UC_PROT_WRITE)
+            break
+        except UcError:
+            candidate += mapped_size + page_size
+
+    emulation_context["heap_next"] = candidate + mapped_size + page_size
+    emulation_context["heap_allocations"][candidate] = allocation_size
+    return candidate

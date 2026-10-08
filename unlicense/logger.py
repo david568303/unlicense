@@ -1,4 +1,6 @@
 import logging
+import os
+import sys
 
 import lief
 
@@ -16,7 +18,8 @@ def setup_logger(logger: logging.Logger, verbose: bool) -> None:
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(log_level)
 
-    stream_handler.setFormatter(CustomFormatter())
+    stream_handler.setFormatter(
+        CustomFormatter(_supports_color(stream_handler.stream)))
 
     logger.addHandler(stream_handler)
 
@@ -39,7 +42,25 @@ class CustomFormatter(logging.Formatter):
         logging.CRITICAL: bold_red + format_problem_str + reset
     }
 
+    def __init__(self, use_color: bool = True):
+        super().__init__()
+        self.use_color = use_color
+
     def format(self, record: logging.LogRecord) -> str:
-        log_fmt = self.FORMATS.get(record.levelno)
+        if self.use_color:
+            log_fmt = self.FORMATS.get(record.levelno)
+        else:
+            log_fmt = self.format_problem_str
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
+
+
+def _supports_color(stream: object) -> bool:
+    is_a_tty = getattr(stream, "isatty", lambda: False)()
+    if not is_a_tty:
+        return False
+    if os.name != "nt":
+        return True
+    # Windows 7 consoles print ANSI escape sequences literally. Windows 10+
+    # terminals used by the existing releases generally support them.
+    return sys.getwindowsversion().major >= 10

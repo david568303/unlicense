@@ -59,6 +59,10 @@ class ProcessController(abc.ABC):
     def enumerate_modules(self) -> List[str]:
         raise NotImplementedError
 
+    def enumerate_pe_candidates(self) -> List[Dict[str, Any]]:
+        """Return PE-like memory mappings when the backend supports it."""
+        return []
+
     @abc.abstractmethod
     def enumerate_module_ranges(
             self,

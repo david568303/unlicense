@@ -4,6 +4,13 @@
 
 ### Added
 - Add a reproducible CPython 3.8 build path for Windows 7 legacy targets.
+- Add compact Themida 2.x wrapper diagnostics and in-memory PE candidate
+  reporting.
+
+### Fixed
+- Simulate Windows heap APIs while resolving import wrappers instead of
+  executing the real heap implementation with an incomplete emulated PEB.
+- Avoid printing raw ANSI color sequences in the Windows 7 console.
 
 ## [0.4.0] - 2023-08-14
 ### Added

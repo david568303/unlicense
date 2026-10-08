@@ -71,6 +71,10 @@ class FridaProcessController(ProcessController):
         value: List[str] = self._frida_rpc.enumerate_modules()
         return value
 
+    def enumerate_pe_candidates(self) -> List[Dict[str, Any]]:
+        value: List[Dict[str, Any]] = self._frida_rpc.enumerate_pe_candidates()
+        return value
+
     def enumerate_module_ranges(
             self,
             module_name: str,

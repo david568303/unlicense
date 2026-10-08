@@ -31,8 +31,15 @@ Run the matching build and the protected target together inside the same
 Windows 7 SP1 guest (or an isolated Windows 7 test machine):
 
 ```powershell
-.\unlicense-win7-x86.exe .\protected-x86.exe --verbose=true --timeout=60
+.\unlicense-win7-x86.exe .\protected-x86.exe --verbose=true --timeout=60 `
+  --diagnostic_output=unlicense-diagnostics.json
 ```
+
+The optional diagnostic report contains PE metadata, loaded-module names,
+small byte windows around detected import wrappers, and emulation failures. It
+does not contain the complete protected or unpacked executable. Themida 2.x
+heap-based wrappers are emulated without entering the real Windows heap, which
+allows import resolution to continue past calls such as `RtlAllocateHeap`.
 
 Unlicense is not a remote dumper: Frida starts the target locally and Scylla
 opens that local process ID.  Consequently, running Unlicense on Windows 10/11
@@ -112,6 +119,9 @@ FLAGS
     --timeout=TIMEOUT
         Type: int
         Default: 10
+    --diagnostic_output=DIAGNOSTIC_OUTPUT
+        Type: Optional[Optional]
+        Default: None
 
 NOTES
     You can also use flags syntax for POSITIONAL ARGUMENTS

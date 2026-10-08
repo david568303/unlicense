@@ -1,6 +1,8 @@
+import json
 import logging
 import struct
-from typing import Dict, Tuple, Any, Optional
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
 
 from capstone import (  # type: ignore
     Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64)
@@ -15,9 +17,12 @@ from .process_control import (ProcessController, Architecture, MemoryRange,
 LOG = logging.getLogger(__name__)
 
 
-def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
-                    image_base: int, oep: int,
-                    text_section_range: MemoryRange) -> None:
+def fix_and_dump_pe(process_controller: ProcessController,
+                    pe_file_path: str,
+                    image_base: int,
+                    oep: int,
+                    text_section_range: MemoryRange,
+                    diagnostic_output: Optional[str] = None) -> None:
     """
     Main dumping routine for Themida/WinLicense 2.x.
     """
@@ -49,6 +54,7 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
                                                      process_controller)
 
     LOG.info("Potential import wrappers found: %d", len(wrapper_set))
+    direct_import_count = len(api_to_calls)
     export_hashes = None
     # Hash-matching strategy is only needed for 32-bit PEs
     if arch == Architecture.X86_32:
@@ -57,9 +63,22 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
                                                 process_controller)
 
     LOG.info("Resolving imports ...")
-    _resolve_imports(api_to_calls, wrapper_set, export_hashes, md,
-                     process_controller)
+    wrapper_diagnostics = _resolve_imports(api_to_calls, wrapper_set,
+                                           export_hashes, exports_dict, md,
+                                           process_controller)
     LOG.info("Imports resolved: %d", len(api_to_calls))
+
+    unresolved_count = sum(1 for wrapper in wrapper_diagnostics
+                           if wrapper.get("resolved_address") is None)
+    if unresolved_count > 0:
+        LOG.warning("Unresolved import wrappers: %d/%d. The dump may not run.",
+                    unresolved_count, len(wrapper_diagnostics))
+
+    if diagnostic_output is not None:
+        _write_diagnostic_report(diagnostic_output, pe_file_path, image_base,
+                                 oep, text_section_range, direct_import_count,
+                                 api_to_calls, wrapper_diagnostics,
+                                 process_controller)
 
     iat_addr, iat_size = _generate_new_iat_in_process(api_to_calls,
                                                       text_section_range.base,
@@ -123,10 +142,12 @@ def _generate_export_hashes(
     return result
 
 
-def _resolve_imports(api_to_calls: ImportToCallSiteDict,
-                     wrapper_set: WrapperSet,
-                     export_hashes: Optional[Dict[int, int]], md: Cs,
-                     process_controller: ProcessController) -> None:
+def _resolve_imports(
+        api_to_calls: ImportToCallSiteDict, wrapper_set: WrapperSet,
+        export_hashes: Optional[Dict[int, int]], exports_dict: Dict[int,
+                                                                    Dict[str,
+                                                                         Any]],
+        md: Cs, process_controller: ProcessController) -> List[Dict[str, Any]]:
     """
     Resolve potential import wrappers by hash-matching or emulation.
     """
@@ -142,21 +163,51 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
             size = page_size - (addr % page_size)
         return process_controller.read_process_memory(addr, size)
 
+    def diagnostic_bytes(addr: int, size: int) -> Optional[str]:
+        try:
+            return get_data(addr, size).hex()
+        except ReadProcessMemoryError:
+            return None
+
+    def record_resolution(record: Dict[str, Any], method: str,
+                          resolved_addr: int) -> None:
+        record["resolution_method"] = method
+        record["resolved_address"] = hex(resolved_addr)
+        export = exports_dict.get(resolved_addr)
+        if export is not None:
+            record["resolved_export"] = export
+
     # Iterate over the set of potential import wrappers and try to resolve them
     resolved_wrappers: Dict[int, int] = {}
     problematic_wrappers = set()
-    for call_addr, call_size, instr_was_jmp, wrapper_addr, _ in wrapper_set:
+    diagnostics: List[Dict[str, Any]] = []
+    for call_addr, call_size, instr_was_jmp, wrapper_addr, ptr_addr in sorted(
+            wrapper_set, key=lambda wrapper: (wrapper[3], wrapper[0])):
+        record: Dict[str, Any] = {
+            "call_address": hex(call_addr),
+            "call_size": call_size,
+            "is_jump": instr_was_jmp,
+            "wrapper_address": hex(wrapper_addr),
+            "pointer_address": None if ptr_addr is None else hex(ptr_addr),
+            "call_site_bytes": diagnostic_bytes(call_addr, 16),
+            "wrapper_bytes": diagnostic_bytes(wrapper_addr, 256),
+            "resolved_address": None,
+        }
+        diagnostics.append(record)
+
         resolved_addr = resolved_wrappers.get(wrapper_addr)
         if resolved_addr is not None:
             LOG.debug("Already resolved wrapper: %s -> %s", hex(wrapper_addr),
                       hex(resolved_addr))
             api_to_calls[resolved_addr].append(
                 (call_addr, call_size, instr_was_jmp))
+            record_resolution(record, "cached", resolved_addr)
             continue
 
         if wrapper_addr in problematic_wrappers:
             # Already failed to resolve this one, ignore
             LOG.debug("Skipping unresolved wrapper")
+            record["resolution_method"] = "previous_failure"
             continue
 
         # If 32-bit executable, try hash-matching
@@ -167,10 +218,11 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
             except Exception as ex:
                 LOG.debug("Failure for wrapper at %s: %s", hex(wrapper_addr),
                           str(ex))
-                problematic_wrappers.add(wrapper_addr)
-                continue
+                record["hash_error"] = str(ex)
+                import_hash = EMPTY_FUNCTION_HASH
             if import_hash != EMPTY_FUNCTION_HASH:
                 LOG.debug("Hash: %s", hex(import_hash))
+                record["function_hash"] = hex(import_hash)
                 resolved_addr = export_hashes.get(import_hash)
                 if resolved_addr is not None:
                     LOG.debug("Hash matched")
@@ -179,19 +231,92 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
                     resolved_wrappers[wrapper_addr] = resolved_addr
                     api_to_calls[resolved_addr].append(
                         (call_addr, call_size, instr_was_jmp))
+                    record_resolution(record, "hash", resolved_addr)
                     continue
 
         # Try to resolve the destination address by emulating the wrapper
+        emulation_diagnostic: Dict[str, Any] = {}
         resolved_addr = resolve_wrapped_api(call_addr, process_controller,
-                                            call_addr + call_size)
+                                            call_addr + call_size,
+                                            emulation_diagnostic)
+        record["emulation"] = emulation_diagnostic
         if resolved_addr is not None:
             LOG.debug("Resolved API: %s -> %s", hex(wrapper_addr),
                       hex(resolved_addr))
             resolved_wrappers[wrapper_addr] = resolved_addr
             api_to_calls[resolved_addr].append(
                 (call_addr, call_size, instr_was_jmp))
+            record_resolution(record, "emulation", resolved_addr)
         else:
+            record["resolution_method"] = "unresolved"
             problematic_wrappers.add(wrapper_addr)
+
+    return diagnostics
+
+
+def _write_diagnostic_report(output_path: str, pe_file_path: str,
+                             image_base: int, oep: int,
+                             text_section_range: MemoryRange,
+                             direct_import_count: int,
+                             api_to_calls: ImportToCallSiteDict,
+                             wrapper_diagnostics: List[Dict[str, Any]],
+                             process_controller: ProcessController) -> None:
+    exports_dict = process_controller.enumerate_exported_functions()
+    collection_errors = []
+    try:
+        loaded_modules = process_controller.enumerate_modules()
+    except Exception as error:  # Diagnostics must not abort the dump.
+        loaded_modules = []
+        collection_errors.append(f"loaded_modules: {error}")
+    try:
+        pe_memory_candidates = process_controller.enumerate_pe_candidates()
+    except Exception as error:  # Diagnostics must not abort the dump.
+        pe_memory_candidates = []
+        collection_errors.append(f"pe_memory_candidates: {error}")
+
+    resolved_imports = []
+    for address, call_sites in api_to_calls.items():
+        resolved_imports.append({
+            "address":
+            hex(address),
+            "export":
+            exports_dict.get(address),
+            "call_sites": [{
+                "address": hex(call_address),
+                "size": call_size,
+                "is_jump": is_jump,
+            } for call_address, call_size, is_jump in call_sites],
+        })
+
+    report = {
+        "format_version": 1,
+        "target_name": Path(pe_file_path).name,
+        "architecture": process_controller.architecture.name,
+        "image_base": hex(image_base),
+        "oep": hex(oep),
+        "text_section": {
+            "base": hex(text_section_range.base),
+            "size": hex(text_section_range.size),
+            "protection": text_section_range.protection,
+        },
+        "loaded_modules": loaded_modules,
+        "pe_memory_candidates": pe_memory_candidates,
+        "collection_errors": collection_errors,
+        "direct_import_count": direct_import_count,
+        "potential_wrapper_count": len(wrapper_diagnostics),
+        "resolved_import_count": len(api_to_calls),
+        "resolved_imports": resolved_imports,
+        "wrappers": wrapper_diagnostics,
+    }
+
+    destination = Path(output_path)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        LOG.info("Diagnostic report saved at '%s'", destination)
+    except OSError as error:
+        LOG.error("Failed to write diagnostic report '%s': %s", destination,
+                  error)
 
 
 def _generate_new_iat_in_process(
