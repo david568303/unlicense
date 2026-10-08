@@ -19,6 +19,10 @@
   section, import directories, resources, and bundle overlay.
 
 ### Fixed
+- Treat export control-flow loops as bounded, deterministic hash input instead
+  of emitting per-function abort warnings, retain every export involved in a
+  fingerprint collision, and defer ambiguous matches to emulation/native
+  tracing instead of selecting an address by enumeration order.
 - Replace synthetic per-wrapper thread execution with one bounded natural-run
   trace in a clone blocked at its real OEP. This lets exception-driven wrappers
   receive their genuine thread state and arguments.

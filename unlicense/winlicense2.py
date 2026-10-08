@@ -17,6 +17,7 @@ from .process_control import (ProcessController, Architecture, MemoryRange,
 
 LOG = logging.getLogger(__name__)
 NON_IMPORT_RESOLUTION_METHODS = {"internal_call", "external_code_target"}
+ExportHashCandidates = Dict[int, List[int]]
 
 
 def fix_and_dump_pe(
@@ -134,12 +135,12 @@ def fix_and_dump_pe(
 
 def _generate_export_hashes(
         md: Cs, exports_dict: Dict[int, Dict[str, Any]],
-        process_controller: ProcessController) -> Dict[int, int]:
+        process_controller: ProcessController) -> ExportHashCandidates:
     """
     Go through the given export dictionary and produce a hash for each function
     listed in it.
     """
-    result = {}
+    result: ExportHashCandidates = {}
     modules = process_controller.enumerate_modules()
     LOG.debug("Hashing exports for %s", str(modules))
     ranges = []
@@ -160,14 +161,38 @@ def _generate_export_hashes(
         return bytes()
 
     exports_count = len(exports_dict)
+    empty_hash_count = 0
+    loop_hash_count = 0
     for i, (export_addr, _) in enumerate(exports_dict.items()):
+        hash_diagnostic: Dict[str, Any] = {}
         export_hash = compute_function_hash(md, export_addr, get_data,
-                                            process_controller)
+                                            process_controller,
+                                            hash_diagnostic)
+        if hash_diagnostic.get("loop_edges", 0):
+            loop_hash_count += 1
         if export_hash != EMPTY_FUNCTION_HASH:
-            result[export_hash] = export_addr
+            # More than one export can legitimately have identical code, and
+            # the mutation-resistant fingerprint is intentionally lossy.  A
+            # single-address dictionary used to overwrite earlier candidates,
+            # making the selected API depend on module/export enumeration
+            # order.  Keep every candidate and require another resolver to
+            # disambiguate collisions.
+            result.setdefault(export_hash, []).append(export_addr)
         else:
-            LOG.debug("Empty hash for %s", hex(export_addr))
-        LOG.debug("Exports hashed: %d/%d", i, exports_count)
+            empty_hash_count += 1
+        completed = i + 1
+        if completed == exports_count or completed % 250 == 0:
+            LOG.debug("Exports hashed: %d/%d", completed, exports_count)
+
+    ambiguous_groups = [
+        addresses for addresses in result.values() if len(addresses) > 1
+    ]
+    LOG.info(
+        "Export fingerprints generated: %d unique, %d ambiguous groups "
+        "covering %d exports, %d empty, %d containing loops", len(result),
+        len(ambiguous_groups),
+        sum(len(addresses) for addresses in ambiguous_groups),
+        empty_hash_count, loop_hash_count)
 
     return result
 
@@ -175,7 +200,7 @@ def _generate_export_hashes(
 def _resolve_imports(
     api_to_calls: ImportToCallSiteDict,
     wrapper_set: WrapperSet,
-    export_hashes: Optional[Dict[int, int]],
+    export_hashes: Optional[ExportHashCandidates],
     exports_dict: Dict[int, Dict[str, Any]],
     md: Cs,
     process_controller: ProcessController,
@@ -274,19 +299,24 @@ def _resolve_imports(
 
         # If 32-bit executable, try hash-matching
         if export_hashes is not None and arch == Architecture.X86_32:
+            hash_diagnostic: Dict[str, Any] = {}
             try:
                 import_hash = compute_function_hash(md, wrapper_addr, get_data,
-                                                    process_controller)
+                                                    process_controller,
+                                                    hash_diagnostic)
             except Exception as ex:
                 LOG.debug("Failure for wrapper at %s: %s", hex(wrapper_addr),
                           str(ex))
                 record["hash_error"] = str(ex)
                 import_hash = EMPTY_FUNCTION_HASH
+            if hash_diagnostic:
+                record["hash_diagnostic"] = hash_diagnostic
             if import_hash != EMPTY_FUNCTION_HASH:
                 LOG.debug("Hash: %s", hex(import_hash))
                 record["function_hash"] = hex(import_hash)
-                resolved_addr = export_hashes.get(import_hash)
-                if resolved_addr is not None:
+                hash_candidates = export_hashes.get(import_hash, [])
+                if len(hash_candidates) == 1:
+                    resolved_addr = hash_candidates[0]
                     LOG.debug("Hash matched")
                     LOG.debug("Resolved API: %s -> %s", hex(wrapper_addr),
                               hex(resolved_addr))
@@ -295,6 +325,18 @@ def _resolve_imports(
                         (call_addr, call_size, instr_was_jmp))
                     record_resolution(record, "hash", resolved_addr)
                     continue
+                if len(hash_candidates) > 1:
+                    record["hash_candidates"] = [{
+                        "address":
+                        hex(candidate),
+                        "export":
+                        exports_dict.get(candidate),
+                    } for candidate in hash_candidates]
+                    record["hash_ambiguous"] = True
+                    LOG.debug(
+                        "Ambiguous hash %s matched %d exports; deferring to "
+                        "emulation/native tracing", hex(import_hash),
+                        len(hash_candidates))
 
         # Try to resolve the destination address by emulating the wrapper
         emulation_diagnostic: Dict[str, Any] = {}

@@ -18,11 +18,14 @@ from unlicense.application import (_create_primary_process,
 from unlicense.dump_utils import _resize_pe
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
 from unlicense.frida_exec import FridaProcessController, _call_with_timeout
+from unlicense.function_hashing import (compute_function_hash,
+                                        EMPTY_FUNCTION_HASH)
 from unlicense.imports import ImportToCallSiteDict
 from unlicense.process_control import (Architecture, MemoryRange,
                                        ProcessController,
                                        ReadProcessMemoryError)
-from unlicense.winlicense2 import (_generate_new_iat_in_process,
+from unlicense.winlicense2 import (_generate_export_hashes,
+                                   _generate_new_iat_in_process,
                                    _resolve_imports, _write_diagnostic_report)
 
 
@@ -46,6 +49,7 @@ class FakeProcessController(ProcessController):
         self.terminate_count = 0
         self.module_addresses: Dict[int, Dict[str, Any]] = {}
         self.module_names: Dict[str, Dict[str, Any]] = {}
+        self.module_ranges: Dict[str, List[MemoryRange]] = {}
         self.adopted_oep: Optional[int] = None
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
@@ -84,7 +88,13 @@ class FakeProcessController(ProcessController):
             self,
             module_name: str,
             include_data: bool = False) -> List[MemoryRange]:
-        return []
+        ranges = self.module_ranges.get(module_name.lower(), [])
+        if include_data:
+            return ranges
+        return [
+            MemoryRange(memory_range.base, memory_range.size,
+                        memory_range.protection) for memory_range in ranges
+        ]
 
     def enumerate_exported_functions(self,
                                      update_cache: bool = False
@@ -587,6 +597,107 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual("external_code_target",
                          diagnostics[0]["resolution_method"])
         hasher.assert_not_called()
+
+    def test_function_hash_handles_back_edge_without_partial_abort(
+            self) -> None:
+        function_address = 0x401000
+        # inc eax; jmp 0x401000
+        function_data = b"\x40\xeb\xfd" + bytes(0x100)
+        controller = FakeProcessController({0x401000: function_data}, {})
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+        diagnostic: Dict[str, Any] = {}
+
+        function_hash = compute_function_hash(
+            disassembler, function_address,
+            lambda address, size: function_data[
+                address - function_address:address - function_address + size],
+            controller, diagnostic)
+
+        self.assertNotEqual(EMPTY_FUNCTION_HASH, function_hash)
+        self.assertEqual("loop", diagnostic["termination"])
+        self.assertEqual(1, diagnostic["loop_edges"])
+        self.assertEqual(1, diagnostic["basic_blocks"])
+
+    def test_export_hash_generation_keeps_all_collision_candidates(
+            self) -> None:
+        first_export = 0x71001000
+        second_export = 0x72001000
+        first_page = b"\xc3" + bytes(0xfff)
+        second_page = b"\xc3" + bytes(0xfff)
+        exports = {
+            first_export: {
+                "name": "FirstApi",
+                "module": "first.dll",
+            },
+            second_export: {
+                "name": "SecondApi",
+                "module": "second.dll",
+            },
+        }
+        controller = FakeProcessController({}, exports)
+        controller.module_ranges = {
+            "ntdll.dll":
+            [MemoryRange(first_export, len(first_page), "r-x", first_page)],
+            "kernel32.dll":
+            [MemoryRange(second_export, len(second_page), "r-x", second_page)],
+        }
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        export_hashes = _generate_export_hashes(disassembler, exports,
+                                                controller)
+
+        self.assertEqual(1, len(export_hashes))
+        self.assertEqual([first_export, second_export],
+                         next(iter(export_hashes.values())))
+
+    def test_ambiguous_hash_is_deferred_instead_of_picking_last_export(
+            self) -> None:
+        call_site = 0x401000
+        wrapper = 0x402000
+        first_export = 0x71001000
+        second_export = 0x72001000
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, wrapper)
+        wrapper_page = b"\xc3" + bytes(0xfff)
+        exports = {
+            first_export: {
+                "name": "FirstApi",
+                "module": "first.dll",
+            },
+            second_export: {
+                "name": "SecondApi",
+                "module": "second.dll",
+            },
+        }
+        controller = FakeProcessController(
+            {
+                call_site: bytes(call_page),
+                wrapper: wrapper_page,
+            }, exports)
+        controller.module_addresses[wrapper] = {
+            "name": "fixture.exe",
+            "base": "0x400000",
+            "size": 0x100000,
+        }
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        with patch("unlicense.winlicense2.compute_function_hash",
+                   return_value=0x12345678), patch(
+                       "unlicense.winlicense2.resolve_wrapped_api",
+                       return_value=None):
+            diagnostics = _resolve_imports(
+                imports, {(call_site, 5, False, wrapper, None)},
+                {0x12345678: [first_export, second_export]}, exports,
+                disassembler, controller)
+
+        self.assertEqual({}, imports)
+        self.assertTrue(diagnostics[0]["hash_ambiguous"])
+        self.assertEqual(2, len(diagnostics[0]["hash_candidates"]))
+        self.assertEqual("unresolved", diagnostics[0]["resolution_method"])
 
     def test_synthetic_heap_search_is_bounded(self) -> None:
         controller = FakeProcessController({}, {})

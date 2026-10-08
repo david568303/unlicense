@@ -1,5 +1,5 @@
 import logging
-from typing import Callable
+from typing import Any, Callable, Dict, Optional
 
 import xxhash  # type: ignore
 from capstone import (Cs, CsInsn)  # type: ignore
@@ -12,9 +12,13 @@ LOG = logging.getLogger(__name__)
 EMPTY_FUNCTION_HASH = int(xxhash.xxh32().digest().hex(), 16)
 
 
-def compute_function_hash(md: Cs, function_start_addr: int,
-                          get_data: Callable[[int, int], bytes],
-                          process_controller: ProcessController) -> int:
+def compute_function_hash(
+    md: Cs,
+    function_start_addr: int,
+    get_data: Callable[[int, int], bytes],
+    process_controller: ProcessController,
+    diagnostic: Optional[Dict[str, Any]] = None,
+) -> int:
     """
     Compute a function's hash with `xxhash` by iterating over all the
     instructions and hashing them, without following JCC and `call` instructions
@@ -23,50 +27,105 @@ def compute_function_hash(md: Cs, function_start_addr: int,
     Themida's mutations on "inlined" imports.
     """
     BB_MAX_SIZE = 0x600
+    MAX_BASIC_BLOCKS = 128
+    MAX_INSTRUCTIONS = 4096
     x = xxhash.xxh32()
 
-    ret_reached = False
     basic_block_addr = function_start_addr
-    prev_basic_block_addr = 0
+    visited_blocks = set()
     visited_addresses = set()
-    while not ret_reached:
-        if prev_basic_block_addr == basic_block_addr:
-            LOG.debug("Not a new basic block, aborting")
+    basic_block_count = 0
+    instruction_count = 0
+    loop_edges = 0
+    termination = "undecodable"
+
+    while basic_block_count < MAX_BASIC_BLOCKS:
+        # Back-edges are normal in real exports.  The old implementation
+        # reported each one as "Loop detected, aborting" and returned a hash of
+        # an arbitrary prefix.  Terminate that path deterministically and add a
+        # structural marker instead, so a loop cannot be confused with a
+        # function that simply ends after the same prefix.
+        if (basic_block_addr in visited_blocks
+                or basic_block_addr in visited_addresses):
+            x.update("cfg-loop")
+            loop_edges += 1
+            termination = "loop"
             break
-        prev_basic_block_addr = basic_block_addr
+
+        visited_blocks.add(basic_block_addr)
+        basic_block_count += 1
         instructions = md.disasm(get_data(basic_block_addr, BB_MAX_SIZE),
                                  basic_block_addr)
+        next_basic_block: Optional[int] = None
+        decoded_instruction = False
+        stop = False
 
         for instruction in instructions:
-            visited_addresses.add(instruction.address)
-            if instruction.mnemonic == "ret":
-                ret_reached = True
-                _hash_instruction(x, instruction, process_controller)
+            decoded_instruction = True
+            if instruction.address in visited_addresses:
+                x.update("cfg-loop")
+                loop_edges += 1
+                termination = "loop"
+                stop = True
                 break
-            elif instruction.mnemonic == "call":
+
+            visited_addresses.add(instruction.address)
+            instruction_count += 1
+            _hash_instruction(x, instruction, process_controller)
+
+            if instruction_count >= MAX_INSTRUCTIONS:
+                termination = "instruction_limit"
+                stop = True
+                break
+
+            if instruction.mnemonic == "ret":
+                termination = "return"
+                stop = True
+                break
+
+            if instruction.mnemonic == "call":
                 op = instruction.operands[0]
                 if op.type == X86_OP_IMM and not _is_in_file_mapping(
                         op.value.imm, process_controller):
-                    basic_block_addr = op.value.imm
+                    next_basic_block = op.value.imm
                     break
-            elif instruction.mnemonic[0] == 'j':
+
+            if instruction.mnemonic.startswith('j'):
                 op = instruction.operands[0]
                 if op.type == X86_OP_IMM:
                     if instruction.mnemonic == "jmp":
-                        if op.value.imm in visited_addresses:
-                            LOG.debug("Loop detected, aborting")
-                            ret_reached = True
-                            _hash_instruction(x, instruction,
-                                              process_controller)
+                        if (op.value.imm in visited_blocks
+                                or op.value.imm in visited_addresses):
+                            x.update("cfg-loop")
+                            loop_edges += 1
+                            termination = "loop"
+                            stop = True
                         else:
-                            basic_block_addr = op.value.imm
+                            next_basic_block = op.value.imm
                         break
                 else:
-                    ret_reached = True
-                    _hash_instruction(x, instruction, process_controller)
+                    termination = "indirect_branch"
+                    stop = True
                     break
 
-            _hash_instruction(x, instruction, process_controller)
+        if stop:
+            break
+        if next_basic_block is not None:
+            basic_block_addr = next_basic_block
+            continue
+        if decoded_instruction:
+            termination = "block_window_end"
+        break
+    else:
+        termination = "basic_block_limit"
+
+    if diagnostic is not None:
+        diagnostic.update({
+            "basic_blocks": basic_block_count,
+            "instructions": instruction_count,
+            "loop_edges": loop_edges,
+            "termination": termination,
+        })
 
     return int(x.digest().hex(), 16)
 
