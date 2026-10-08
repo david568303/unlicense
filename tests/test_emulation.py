@@ -28,6 +28,7 @@ class FakeProcessController(ProcessController):
         self.exports = exports
         self.trace_results: Dict[int, int] = {}
         self.trace_timeout = 0
+        self.active_probe = False
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
         return None
@@ -61,10 +62,13 @@ class FakeProcessController(ProcessController):
                                      ) -> Dict[int, Dict[str, Any]]:
         return self.exports
 
-    def trace_wrapped_imports(self, wrappers: List[Dict[str, Any]],
-                              timeout_ms: int) -> Dict[int, int]:
+    def trace_wrapped_imports(self,
+                              wrappers: List[Dict[str, Any]],
+                              timeout_ms: int,
+                              active_probe: bool = False) -> Dict[int, int]:
         del wrappers
         self.trace_timeout = timeout_ms
+        self.active_probe = active_probe
         return self.trace_results
 
     def allocate_process_memory(self, size: int, near: int) -> int:
@@ -120,11 +124,12 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         diagnostics = _resolve_imports(imports,
                                        {(call_site, 5, False, wrapper, None)},
                                        None, exports, disassembler, controller,
-                                       250)
+                                       250, True)
 
         self.assertEqual([(call_site, 5, False)], imports[target_api])
         self.assertEqual("native_trace", diagnostics[0]["resolution_method"])
         self.assertEqual(250, controller.trace_timeout)
+        self.assertTrue(controller.active_probe)
 
     def test_synthetic_heap_search_is_bounded(self) -> None:
         controller = FakeProcessController({}, {})

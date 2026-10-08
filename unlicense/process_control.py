@@ -63,10 +63,12 @@ class ProcessController(abc.ABC):
         """Return PE-like memory mappings when the backend supports it."""
         return []
 
-    def trace_wrapped_imports(self, wrappers: List[Dict[str, Any]],
-                              timeout_ms: int) -> Dict[int, int]:
+    def trace_wrapped_imports(self,
+                              wrappers: List[Dict[str, Any]],
+                              timeout_ms: int,
+                              active_probe: bool = False) -> Dict[int, int]:
         """Resolve wrappers through native execution when supported."""
-        del wrappers, timeout_ms
+        del wrappers, timeout_ms, active_probe
         return {}
 
     @abc.abstractmethod

@@ -9,6 +9,8 @@
 - Add an opt-in native Frida Stalker fallback for exception-driven wrappers.
   It follows worker threads created by bundled applications and reports trace
   counters for troubleshooting paths that were not executed.
+- Add an experimental, opt-in active probe for 32-bit exception-driven import
+  wrappers that are never reached during passive tracing.
 
 ### Fixed
 - Simulate Windows heap APIs while resolving import wrappers instead of

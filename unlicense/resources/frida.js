@@ -371,11 +371,16 @@ rpc.exports = {
             activeByThread: new Map(),
             followedThreads: new Set(),
             resolutions: new Map(),
+            wrapperRequests: wrappers,
             wrappersByAddress: wrappersByAddress,
             returnsByAddress: returnsByAddress,
             exportsByAddress: exportsByAddress,
+            makeTraceOptions: null,
             pollTimer: null,
             stats: {
+                activeProbeErrors: [],
+                activeProbeReturns: 0,
+                activeProbes: 0,
                 compiledBlocks: 0,
                 exportHits: 0,
                 returnHits: 0,
@@ -404,7 +409,7 @@ rpc.exports = {
 
         function makeTraceOptions(threadId) {
             return {
-              transform(iterator) {
+                transform(iterator) {
                 let instruction = iterator.next();
                 if (instruction === null) {
                     return;
@@ -470,9 +475,10 @@ rpc.exports = {
                 do {
                     iterator.keep();
                 } while ((instruction = iterator.next()) !== null);
-              }
+                }
             };
         }
+        state.makeTraceOptions = makeTraceOptions;
 
         const agentThreadId = Process.getCurrentThreadId();
         function followThread(threadId) {
@@ -498,6 +504,148 @@ rpc.exports = {
         // The OEP was made non-executable only to detect it. Native tracing
         // now needs to let the original thread continue normally.
         setOepRangesProtection('rwx');
+    },
+    probeWrapperTrace: function () {
+        if (wrapperTraceState === null) {
+            throw new Error('Native wrapper tracing is not initialized');
+        }
+        if (Process.arch !== 'ia32') {
+            throw new Error('Active wrapper probing currently supports ia32 only');
+        }
+
+        const state = wrapperTraceState;
+        const nativeOptions = { abi: 'stdcall', exceptions: 'steal' };
+        const createThread = new NativeFunction(
+            Module.findExportByName('kernel32.dll', 'CreateThread'),
+            'pointer',
+            ['pointer', 'uint32', 'pointer', 'pointer', 'uint32', 'pointer'],
+            nativeOptions);
+        const resumeThread = new NativeFunction(
+            Module.findExportByName('kernel32.dll', 'ResumeThread'),
+            'uint32', ['pointer'], nativeOptions);
+        const waitForSingleObject = new NativeFunction(
+            Module.findExportByName('kernel32.dll', 'WaitForSingleObject'),
+            'uint32', ['pointer', 'uint32'], nativeOptions);
+        const terminateThread = new NativeFunction(
+            Module.findExportByName('kernel32.dll', 'TerminateThread'),
+            'bool', ['pointer', 'uint32'], nativeOptions);
+        const closeHandle = new NativeFunction(
+            Module.findExportByName('kernel32.dll', 'CloseHandle'),
+            'bool', ['pointer'], nativeOptions);
+
+        const probedWrappers = new Set();
+        state.wrapperRequests.forEach(request => {
+            const callKey = ptr(request.callAddress).toString();
+            const wrapperKey = ptr(request.wrapperAddress).toString();
+            if (probedWrappers.has(wrapperKey) ||
+                    state.resolutions.has(callKey)) {
+                return;
+            }
+            probedWrappers.add(wrapperKey);
+            state.stats.activeProbes++;
+
+            const callAddress = ptr(request.callAddress);
+            const returnAddress = ptr(request.returnAddress);
+            const instructionAddress = callAddress.readU8() === 0x90
+                ? callAddress.add(1)
+                : callAddress;
+            const opcode = instructionAddress.readU8();
+            const instructionIsJump = opcode === 0xe9 ||
+                (opcode === 0xff && instructionAddress.add(1).readU8() === 0x25);
+            let savedReturnBytes = null;
+            let threadHandle = null;
+            let probeThreadId = null;
+            let threadFinished = false;
+            try {
+                const trampoline = Memory.alloc(Process.pageSize);
+                allocatedBuffers.push(trampoline);
+                const writer = new X86Writer(trampoline, { pc: trampoline });
+                writer.putPushReg('ebp');
+                writer.putMovRegReg('ebp', 'esp');
+                // Give wrappers and the resolved API a zero-filled argument
+                // area without making assumptions about their signatures.
+                for (let index = 0; index < 32; index++) {
+                    writer.putPushU32(0);
+                }
+                writer.putCallAddress(callAddress);
+                const cleanupAddress = writer.code;
+                writer.putMovRegReg('esp', 'ebp');
+                writer.putPopReg('ebp');
+                writer.putRetImm(4);
+                writer.flush();
+                Memory.protect(trampoline, Process.pageSize, 'r-x');
+
+                // Calling the original call site preserves the return address
+                // expected by exception-driven wrappers. For CALL sites,
+                // temporarily jump from that address to our stack cleanup.
+                // This also survives stdcall APIs that pop their arguments.
+                if (!instructionIsJump) {
+                    savedReturnBytes = returnAddress.readByteArray(5);
+                    Memory.patchCode(returnAddress, 5, writable => {
+                        const returnWriter = new X86Writer(writable, {
+                            pc: returnAddress
+                        });
+                        returnWriter.putJmpAddress(cleanupAddress);
+                        returnWriter.flush();
+                    });
+                }
+
+                const threadIdStorage = Memory.alloc(4);
+                threadIdStorage.writeU32(0);
+                threadHandle = createThread(ptr(0), 0, trampoline, ptr(0),
+                                            0x4, threadIdStorage);
+                if (threadHandle.isNull()) {
+                    throw new Error('CreateThread failed');
+                }
+                probeThreadId = threadIdStorage.readU32();
+                Stalker.follow(probeThreadId,
+                               state.makeTraceOptions(probeThreadId));
+                state.followedThreads.add(probeThreadId);
+                state.stats.threadIds.push(probeThreadId);
+
+                if (resumeThread(threadHandle) === 0xffffffff) {
+                    throw new Error('ResumeThread failed');
+                }
+                const waitResult = waitForSingleObject(threadHandle, 2000);
+                if (waitResult === 0) {
+                    threadFinished = true;
+                    state.stats.activeProbeReturns++;
+                }
+                else if (waitResult === 0x102) {
+                    throw new Error('probe timed out after 2000 ms');
+                }
+                else {
+                    throw new Error(`WaitForSingleObject failed: ${waitResult}`);
+                }
+            }
+            catch (error) {
+                state.stats.activeProbeErrors.push(
+                    `${request.callAddress}: ${error}`);
+            }
+            finally {
+                if (threadHandle !== null && !threadFinished) {
+                    terminateThread(threadHandle, 0xdead);
+                    waitForSingleObject(threadHandle, 1000);
+                }
+                if (probeThreadId !== null) {
+                    try {
+                        Stalker.unfollow(probeThreadId);
+                    }
+                    catch (_error) {
+                        // The probe thread may already have exited.
+                    }
+                    state.followedThreads.delete(probeThreadId);
+                }
+                if (threadHandle !== null) {
+                    closeHandle(threadHandle);
+                }
+                if (savedReturnBytes !== null) {
+                    Memory.patchCode(returnAddress, 5, writable => {
+                        writable.writeByteArray(savedReturnBytes);
+                    });
+                }
+            }
+        });
     },
     collectWrapperTrace: function () {
         if (wrapperTraceState === null) {

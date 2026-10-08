@@ -54,6 +54,26 @@ The native fallback is disabled by default because it lets the target execute
 normally for the requested number of milliseconds. Use it only in an isolated
 test system where target-side effects are acceptable.
 
+If passive tracing reports `wrapper_hits=0`, the remaining wrappers were not
+executed naturally. For 32-bit targets, an experimental active probe can invoke
+each unresolved call site while the OEP thread is still blocked:
+
+```powershell
+.\unlicense-win7-x86.exe .\protected-x86.exe --verbose=true --timeout=60 `
+  --active_wrapper_probe=true `
+  --diagnostic_output=unlicense-diagnostics.json
+```
+
+The active probe supplies synthetic zero-filled arguments and temporarily
+places a jump to controlled stack cleanup after each probed CALL. It restores
+the original bytes immediately afterward, but the resolved Windows API is
+really invoked.
+It can therefore crash, terminate, or otherwise affect the target process.
+Use this option only in a disposable, isolated VM snapshot. It currently
+supports 32-bit targets only. `--native_trace_timeout` may be combined with it,
+but is not required. Each active call is isolated in a probe thread and limited
+to two seconds so a non-returning wrapper does not stall the whole dump.
+
 Unlicense is not a remote dumper: Frida starts the target locally and Scylla
 opens that local process ID.  Consequently, running Unlicense on Windows 10/11
 while the target runs in a Windows 7 VM will not work without replacing the
@@ -138,6 +158,9 @@ FLAGS
     --native_trace_timeout=NATIVE_TRACE_TIMEOUT
         Type: int
         Default: 0
+    --active_wrapper_probe=ACTIVE_WRAPPER_PROBE
+        Type: bool
+        Default: False
 
 NOTES
     You can also use flags syntax for POSITIONAL ARGUMENTS

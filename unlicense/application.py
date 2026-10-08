@@ -31,6 +31,7 @@ def run_unlicense(
     timeout: int = 10,
     diagnostic_output: Optional[str] = None,
     native_trace_timeout: int = 0,
+    active_wrapper_probe: bool = False,
 ) -> None:
     """
     Unpack executables protected with Themida/WinLicense 2.x and 3.x
@@ -120,7 +121,8 @@ def run_unlicense(
             winlicense2.fix_and_dump_pe(process_controller, pe_to_dump,
                                         dumped_image_base, dumped_oep,
                                         text_section_range, diagnostic_output,
-                                        native_trace_timeout)
+                                        native_trace_timeout,
+                                        active_wrapper_probe)
         elif target_version == 3:
             if diagnostic_output is not None:
                 LOG.warning(

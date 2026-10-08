@@ -77,26 +77,49 @@ class FridaProcessController(ProcessController):
         value: List[Dict[str, Any]] = self._frida_rpc.enumerate_pe_candidates()
         return value
 
-    def trace_wrapped_imports(self, wrappers: List[Dict[str, Any]],
-                              timeout_ms: int) -> Dict[int, int]:
+    def trace_wrapped_imports(self,
+                              wrappers: List[Dict[str, Any]],
+                              timeout_ms: int,
+                              active_probe: bool = False) -> Dict[int, int]:
         self._frida_rpc.setup_wrapper_trace(wrappers, self.main_module_name)
-        self._frida_script.post({"type": "block_on_oep"})
-        time.sleep(max(0, timeout_ms) / 1000.0)
+        if active_probe:
+            self._frida_rpc.probe_wrapper_trace()
+        if timeout_ms > 0:
+            self._frida_script.post({"type": "block_on_oep"})
+            time.sleep(timeout_ms / 1000.0)
         trace_data: Dict[str, Any] = self._frida_rpc.collect_wrapper_trace()
         value: List[Dict[str, Any]] = trace_data.get("results", [])
         stats: Optional[Dict[str, Any]] = trace_data.get("stats")
         if stats is not None:
             LOG.info(
                 "Native trace stats: threads=%d blocks=%d wrapper_hits=%d "
-                "export_hits=%d return_hits=%d",
+                "export_hits=%d return_hits=%d active_probes=%d "
+                "active_returns=%d active_errors=%d",
                 len(stats.get("threadIds",
                               [])), stats.get("compiledBlocks", 0),
                 stats.get("wrapperHits", 0), stats.get("exportHits", 0),
-                stats.get("returnHits", 0))
-        return {
+                stats.get("returnHits", 0), stats.get("activeProbes", 0),
+                stats.get("activeProbeReturns", 0),
+                len(stats.get("activeProbeErrors", [])))
+            for probe_error in stats.get("activeProbeErrors", []):
+                LOG.debug("Active wrapper probe error: %s", probe_error)
+
+        traced = {
             int(result["callAddress"], 16): int(result["address"], 16)
             for result in value
         }
+        # One protected wrapper may be referenced by several call sites. A
+        # successful native probe resolves all of them, even though Stalker
+        # records the first matching call site only.
+        by_wrapper = {
+            result["wrapperAddress"].lower(): int(result["address"], 16)
+            for result in value
+        }
+        for wrapper in wrappers:
+            resolved = by_wrapper.get(wrapper["wrapperAddress"].lower())
+            if resolved is not None:
+                traced[int(wrapper["callAddress"], 16)] = resolved
+        return traced
 
     def enumerate_module_ranges(
             self,

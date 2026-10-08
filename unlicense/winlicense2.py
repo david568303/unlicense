@@ -23,7 +23,8 @@ def fix_and_dump_pe(process_controller: ProcessController,
                     oep: int,
                     text_section_range: MemoryRange,
                     diagnostic_output: Optional[str] = None,
-                    native_trace_timeout: int = 0) -> None:
+                    native_trace_timeout: int = 0,
+                    active_wrapper_probe: bool = False) -> None:
     """
     Main dumping routine for Themida/WinLicense 2.x.
     """
@@ -67,7 +68,8 @@ def fix_and_dump_pe(process_controller: ProcessController,
     wrapper_diagnostics = _resolve_imports(api_to_calls, wrapper_set,
                                            export_hashes, exports_dict, md,
                                            process_controller,
-                                           native_trace_timeout)
+                                           native_trace_timeout,
+                                           active_wrapper_probe)
     LOG.info("Imports resolved: %d", len(api_to_calls))
 
     unresolved_count = sum(1 for wrapper in wrapper_diagnostics
@@ -144,13 +146,15 @@ def _generate_export_hashes(
     return result
 
 
-def _resolve_imports(api_to_calls: ImportToCallSiteDict,
-                     wrapper_set: WrapperSet,
-                     export_hashes: Optional[Dict[int, int]],
-                     exports_dict: Dict[int, Dict[str, Any]],
-                     md: Cs,
-                     process_controller: ProcessController,
-                     native_trace_timeout: int = 0) -> List[Dict[str, Any]]:
+def _resolve_imports(
+        api_to_calls: ImportToCallSiteDict,
+        wrapper_set: WrapperSet,
+        export_hashes: Optional[Dict[int, int]],
+        exports_dict: Dict[int, Dict[str, Any]],
+        md: Cs,
+        process_controller: ProcessController,
+        native_trace_timeout: int = 0,
+        active_wrapper_probe: bool = False) -> List[Dict[str, Any]]:
     """
     Resolve potential import wrappers by hash-matching or emulation.
     """
@@ -258,22 +262,33 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
         record for record in diagnostics
         if record.get("resolved_address") is None
     ]
-    if native_trace_timeout > 0 and unresolved_records:
+    if (native_trace_timeout > 0
+            or active_wrapper_probe) and unresolved_records:
         trace_requests = [{
             "callAddress":
             record["call_address"],
             "wrapperAddress":
             record["wrapper_address"],
             "returnAddress":
-            hex(int(record["call_address"], 16) + int(record["call_size"])),
+            hex(
+                int(record["call_address"], 16) + int(record["call_size"]) +
+                (1 if str(record.get("call_site_bytes", "")).
+                 startswith("90") else 0)),
             "isJump":
             bool(record["is_jump"]),
         } for record in unresolved_records]
-        LOG.warning("Running the target for %d ms to trace %d native wrappers",
-                    native_trace_timeout, len(trace_requests))
+        if active_wrapper_probe:
+            LOG.warning(
+                "Actively invoking %d unresolved wrappers with synthetic "
+                "arguments; the target may crash or have side effects",
+                len(trace_requests))
+        if native_trace_timeout > 0:
+            LOG.warning(
+                "Running the target for %d ms to trace %d native wrappers",
+                native_trace_timeout, len(trace_requests))
         try:
             traced_imports = process_controller.trace_wrapped_imports(
-                trace_requests, native_trace_timeout)
+                trace_requests, native_trace_timeout, active_wrapper_probe)
         except Exception as error:
             LOG.warning("Native wrapper tracing failed: %s", error)
             traced_imports = {}
