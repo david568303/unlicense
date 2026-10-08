@@ -69,6 +69,10 @@ DLL export, even when the intermediate wrapper remains inside the unpacked
 the host revalidates each call site before patching it. A call site observed
 with different export destinations or without enough patch space is left
 untouched and reported in the diagnostic JSON.
+Frame-relative six-byte calls such as `FF 95 disp32` (`CALL [EBP+disp32]`) are
+also supported. Their original register-relative slot is replaced in place by
+an absolute reference to the reconstructed IAT. Forwarded exports that enter a
+same-named KERNELBASE implementation retain the first public import module.
 
 If neither static nor native wrapper recovery produces an import, Unlicense
 preserves the dumped image's existing import directory and bypasses Scylla's

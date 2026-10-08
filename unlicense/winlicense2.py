@@ -111,18 +111,10 @@ def fix_and_dump_pe(
         if iat_size:
             LOG.info("Generated the fake IAT at %s, size=%s", hex(iat_addr),
                      hex(iat_size))
-            # Ensure the range is writable
-            process_controller.set_memory_protection(text_section_range.base,
-                                                     text_section_range.size,
-                                                     "rwx")
             # Replace detected references to wrappers or imports
             LOG.info("Patching call and jmp sites ...")
             _fix_import_references_in_process(api_to_calls, iat_addr,
                                               process_controller)
-            # Restore memory protection to RX
-            process_controller.set_memory_protection(text_section_range.base,
-                                                     text_section_range.size,
-                                                     "r-x")
         else:
             LOG.warning("No reliable imports were resolved; preserving all "
                         "original call sites and rebuilding without a fake "
@@ -421,6 +413,13 @@ def _resolve_imports(
             if call_bytes[:2] == b"\x90\xe8" and len(call_bytes) >= 7:
                 expected_size = 5
             elif call_bytes[:2] == b"\xff\x15" and len(call_bytes) >= 7:
+                expected_size = 6
+            elif (len(call_bytes) >= 7 and call_bytes[0] == 0xff
+                  and ((call_bytes[1] >> 3) & 7) == 2
+                  and (call_bytes[1] & 0xc0) == 0x80):
+                # CALL r/m32 with a disp32 operand (for example FF 95 for
+                # CALL [EBP+disp32]) has the six-byte window required for an
+                # in-place FF 15 [absolute IAT] replacement.
                 expected_size = 6
             elif (call_bytes[:1] == b"\xe8" and len(call_bytes) >= 6
                   and call_bytes[5] in (0x90, 0xcc)):
@@ -802,24 +801,48 @@ def _fix_import_references_in_process(
     """
     arch = process_controller.architecture
     ptr_size = process_controller.pointer_size
+    changed_pages: Dict[int, str] = {}
+    checked_pages = set()
+    try:
+        for i, call_addrs in enumerate(api_to_calls.values()):
+            for call_addr, _, instr_was_jmp in call_addrs:
+                page_base = call_addr - call_addr % process_controller.page_size
+                if page_base not in checked_pages:
+                    protection = process_controller.query_memory_protection(
+                        call_addr)
+                    checked_pages.add(page_base)
+                    if len(protection) < 2 or protection[1] != "w":
+                        if not process_controller.set_memory_protection(
+                                page_base, process_controller.page_size,
+                                "rwx"):
+                            raise RuntimeError(
+                                "failed to make import call page writable at "
+                                f"{hex(page_base)}")
+                        changed_pages[page_base] = protection
 
-    for i, call_addrs in enumerate(api_to_calls.values()):
-        for call_addr, _, instr_was_jmp in call_addrs:
-            if arch == Architecture.X86_32:
-                # Absolute
-                operand = iat_addr + i * ptr_size
-                fmt = "<I"
-            elif arch == Architecture.X86_64:
-                # RIP-relative
-                operand = iat_addr + i * ptr_size - (call_addr + 6)
-                fmt = "<i"
-            else:
-                raise NotImplementedError(f"Unsupported architecture: {arch}")
+                if arch == Architecture.X86_32:
+                    # Absolute
+                    operand = iat_addr + i * ptr_size
+                    fmt = "<I"
+                elif arch == Architecture.X86_64:
+                    # RIP-relative
+                    operand = iat_addr + i * ptr_size - (call_addr + 6)
+                    fmt = "<i"
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported architecture: {arch}")
 
-            if instr_was_jmp:
-                # jmp [iat_addr + i * ptr_size]
-                new_instr = bytes([0xFF, 0x25]) + struct.pack(fmt, operand)
-            else:
-                # call [iat_addr + i * ptr_size]
-                new_instr = bytes([0xFF, 0x15]) + struct.pack(fmt, operand)
-            process_controller.write_process_memory(call_addr, list(new_instr))
+                if instr_was_jmp:
+                    # jmp [iat_addr + i * ptr_size]
+                    new_instr = bytes([0xFF, 0x25]) + struct.pack(fmt, operand)
+                else:
+                    # call [iat_addr + i * ptr_size]
+                    new_instr = bytes([0xFF, 0x15]) + struct.pack(fmt, operand)
+                process_controller.write_process_memory(call_addr,
+                                                        list(new_instr))
+    finally:
+        for page_base, protection in changed_pages.items():
+            if not process_controller.set_memory_protection(
+                    page_base, process_controller.page_size, protection):
+                LOG.warning("Failed to restore memory protection %s at %s",
+                            protection, hex(page_base))

@@ -22,6 +22,13 @@
   `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
+- Recover six-byte frame-relative import calls such as `FF 95 disp32`
+  (`CALL [EBP+disp32]`) observed in Themida's runtime sections. They are now
+  safely rewritten in place as `FF 15 [IAT]`, including call sites outside the
+  original `.text` section with page protections restored after patching.
+- Treat consecutive entries into same-named forwarded exports (for example
+  `kernel32!Sleep` followed by `KERNELBASE!Sleep`) as one loader-stable import
+  instead of an address conflict.
 - Disable automatic Scylla IAT searching when verified import recovery is
   empty. Its advanced heuristic returned `0x330a1c` bytes of unrelated memory
   for the test bundle; even a trimmed fragment caused an access violation

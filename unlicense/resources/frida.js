@@ -464,6 +464,7 @@ rpc.exports = {
                 activeExportTrail: [],
                 compiledBlocks: 0,
                 exportHits: 0,
+                forwardedExportAliases: 0,
                 observedImportConflicts: 0,
                 observedImportHits: 0,
                 returnHits: 0,
@@ -532,6 +533,16 @@ rpc.exports = {
                 callSize = 6;
                 isJump = bytes[6] === 0xcc;
             }
+            // Themida also keeps its resolved API pointers in a frame-relative
+            // table and emits CALL [reg+disp32] (observed as FF 95 disp32 for
+            // EBP). It is exactly six bytes and can safely become FF 15 [IAT].
+            else if (bytes[0] === 0xff &&
+                    ((bytes[1] >> 3) & 7) === 2 &&
+                    (bytes[1] & 0xc0) === 0x80) {
+                callAddress = windowAddress;
+                callSize = 6;
+                isJump = false;
+            }
             else if (bytes[1] === 0xe8 &&
                     (bytes[6] === 0x90 || bytes[6] === 0xcc)) {
                 callAddress = windowAddress.add(1);
@@ -561,6 +572,17 @@ rpc.exports = {
             }
             const existing = state.observedImports.get(callKey);
             if (existing !== undefined && existing.address !== exportInfo.address) {
+                // Forwarded Win32 exports enter both the facade (for example
+                // kernel32!Sleep) and its KERNELBASE implementation without
+                // changing the caller's return address. Preserve the first,
+                // loader-stable import instead of reporting a false conflict.
+                if (existing.name.toLowerCase() ===
+                        exportInfo.name.toLowerCase()) {
+                    existing.hits++;
+                    state.stats.observedImportHits++;
+                    state.stats.forwardedExportAliases++;
+                    return;
+                }
                 state.observedImports.delete(callKey);
                 state.observedImportConflicts.add(callKey);
                 state.stats.observedImportConflicts++;

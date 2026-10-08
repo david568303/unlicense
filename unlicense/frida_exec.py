@@ -172,7 +172,8 @@ class FridaProcessController(ProcessController):
             LOG.info(
                 "Native trace stats: threads=%d blocks=%d wrapper_hits=%d "
                 "export_hits=%d return_hits=%d observed_imports=%d "
-                "observed_conflicts=%d unpatchable_exports=%d "
+                "observed_conflicts=%d forwarded_aliases=%d "
+                "unpatchable_exports=%d "
                 "active_probes=%d active_returns=%d skipped_final_apis=%d "
                 "active_errors=%d",
                 len(stats.get("threadIds",
@@ -180,6 +181,7 @@ class FridaProcessController(ProcessController):
                 stats.get("wrapperHits", 0), stats.get("exportHits", 0),
                 stats.get("returnHits", 0), len(observed_imports),
                 stats.get("observedImportConflicts", 0),
+                stats.get("forwardedExportAliases", 0),
                 stats.get("unpatchableExportReturns", 0),
                 stats.get("activeProbes", 0),
                 stats.get("activeProbeReturns", 0),

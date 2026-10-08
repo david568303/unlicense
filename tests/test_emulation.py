@@ -28,6 +28,7 @@ from unlicense.process_control import (Architecture, MemoryRange,
                                        ReadProcessMemoryError)
 from unlicense.winlicense2 import (_generate_export_hashes,
                                    _generate_new_iat_in_process,
+                                   _fix_import_references_in_process,
                                    _resolve_imports, _write_diagnostic_report)
 
 
@@ -54,6 +55,9 @@ class FakeProcessController(ProcessController):
         self.module_names: Dict[str, Dict[str, Any]] = {}
         self.module_ranges: Dict[str, List[MemoryRange]] = {}
         self.adopted_oep: Optional[int] = None
+        self.protections: Dict[int, str] = {}
+        self.protection_changes: List[Tuple[int, int, str]] = []
+        self.memory_writes: List[Tuple[int, List[int]]] = []
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
         return self.module_addresses.get(address)
@@ -131,11 +135,14 @@ class FakeProcessController(ProcessController):
         raise NotImplementedError
 
     def query_memory_protection(self, address: int) -> str:
-        raise NotImplementedError
+        page_base = address - address % self.page_size
+        return self.protections.get(page_base, "r-x")
 
     def set_memory_protection(self, address: int, size: int,
                               protection: str) -> bool:
-        raise NotImplementedError
+        self.protections[address] = protection
+        self.protection_changes.append((address, size, protection))
+        return True
 
     def read_process_memory(self, address: int, size: int) -> bytes:
         page_base = address - address % self.page_size
@@ -146,7 +153,14 @@ class FakeProcessController(ProcessController):
         return page[page_offset:page_offset + size]
 
     def write_process_memory(self, address: int, data: List[int]) -> None:
-        raise NotImplementedError
+        self.memory_writes.append((address, data))
+        page_base = address - address % self.page_size
+        page = self.pages.get(page_base)
+        if page is not None:
+            mutable_page = bytearray(page)
+            offset = address - page_base
+            mutable_page[offset:offset + len(data)] = bytes(data)
+            self.pages[page_base] = bytes(mutable_page)
 
     def terminate_process(self) -> None:
         self.terminate_count += 1
@@ -512,6 +526,43 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual({}, imports)
         self.assertIn("safe Themida patch window",
                       controller.last_observed_imports[0]["rejection_reason"])
+
+    def test_native_trace_accepts_and_patches_frame_relative_import_call(
+            self) -> None:
+        call_site = 0x401000
+        target_api = 0x755310ff
+        iat_address = 0x6400000
+        call_page = bytearray(0x1000)
+        call_page[0:6] = b"\xff\x95\x54\x1a\x74\x0b"
+        controller = FakeProcessController(
+            {call_site: bytes(call_page)}, {target_api: {
+                "name": "Sleep",
+                "module": "kernel32.dll",
+            }})
+        controller.trace_observed_imports = [{
+            "callAddress": hex(call_site),
+            "callSize": 6,
+            "isJump": False,
+            "address": hex(target_api),
+            "name": "Sleep",
+            "module": "kernel32.dll",
+            "hits": 3,
+        }]
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        _resolve_imports(imports, set(), None, controller.exports,
+                         disassembler, controller, 250, False)
+        _fix_import_references_in_process(imports, iat_address, controller)
+
+        self.assertEqual([(call_site, 6, False)], imports[target_api])
+        self.assertTrue(controller.last_observed_imports[0]["accepted"])
+        self.assertEqual(b"\xff\x15" + struct.pack("<I", iat_address),
+                         controller.pages[call_site][:6])
+        self.assertEqual([(call_site, 0x1000, "rwx"),
+                          (call_site, 0x1000, "r-x")],
+                         controller.protection_changes)
 
     def test_active_trace_uses_sacrificial_process_and_translates_export(
             self) -> None:
