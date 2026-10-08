@@ -77,19 +77,22 @@ class FridaProcessController(ProcessController):
         value: List[Dict[str, Any]] = self._frida_rpc.enumerate_pe_candidates()
         return value
 
-    def trace_wrapped_imports(self,
-                              wrappers: List[Dict[str, Any]],
-                              timeout_ms: int,
-                              active_probe: bool = False) -> Dict[int, int]:
+    def trace_wrapped_imports(
+            self,
+            wrappers: List[Dict[str, Any]],
+            timeout_ms: int,
+            active_probe: bool = False,
+            active_probe_timeout_ms: int = 5000) -> Dict[int, int]:
         self._frida_rpc.setup_wrapper_trace(wrappers, self.main_module_name)
         if active_probe:
-            self._frida_rpc.probe_wrapper_trace()
+            self._frida_rpc.probe_wrapper_trace(active_probe_timeout_ms)
         if timeout_ms > 0:
             self._frida_script.post({"type": "block_on_oep"})
             time.sleep(timeout_ms / 1000.0)
         trace_data: Dict[str, Any] = self._frida_rpc.collect_wrapper_trace()
         value: List[Dict[str, Any]] = trace_data.get("results", [])
         stats: Optional[Dict[str, Any]] = trace_data.get("stats")
+        self.last_wrapper_trace_stats = stats
         if stats is not None:
             LOG.info(
                 "Native trace stats: threads=%d blocks=%d wrapper_hits=%d "
@@ -242,23 +245,38 @@ def spawn_and_instrument(
     else:
         pid = frida.spawn(str(pe_path))
 
-    main_module_name = pe_path.name
-    session = frida.attach(pid)
-    frida_js = resources.open_text("unlicense.resources", "frida.js").read()
-    script = session.create_script(frida_js)
-    on_message_callback = functools.partial(_frida_callback,
-                                            notify_oep_reached)
-    script.on('message', on_message_callback)
-    script.load()
+    session: Optional[frida.core.Session] = None
+    try:
+        main_module_name = pe_path.name
+        session = frida.attach(pid)
+        frida_js = resources.open_text("unlicense.resources",
+                                       "frida.js").read()
+        script = session.create_script(frida_js)
+        on_message_callback = functools.partial(_frida_callback,
+                                                notify_oep_reached)
+        script.on('message', on_message_callback)
+        script.load()
 
-    frida_rpc = script.exports
-    process_controller = FridaProcessController(pid, main_module_name, session,
-                                                script)
-    frida_rpc.setup_oep_tracing(pe_path.name, [[r.base, r.size]
-                                               for r in text_section_ranges])
-    frida.resume(pid)
-
-    return process_controller
+        frida_rpc = script.exports
+        process_controller = FridaProcessController(pid, main_module_name,
+                                                    session, script)
+        frida_rpc.setup_oep_tracing(pe_path.name,
+                                    [[r.base, r.size]
+                                     for r in text_section_ranges])
+        frida.resume(pid)
+        return process_controller
+    except Exception:
+        # A failed attach/script setup otherwise leaves a suspended orphan.
+        if session is not None:
+            try:
+                session.detach()
+            except _TEARDOWN_ERRORS:
+                pass
+        try:
+            frida.kill(pid)
+        except _TEARDOWN_ERRORS:
+            pass
+        raise
 
 
 def _frida_callback(notify_oep_reached: OepReachedCallback,

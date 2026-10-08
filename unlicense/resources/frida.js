@@ -542,7 +542,7 @@ rpc.exports = {
         // now needs to let the original thread continue normally.
         setOepRangesProtection('rwx');
     },
-    probeWrapperTrace: function () {
+    probeWrapperTrace: function (timeoutMs) {
         if (wrapperTraceState === null) {
             throw new Error('Native wrapper tracing is not initialized');
         }
@@ -551,6 +551,8 @@ rpc.exports = {
         }
 
         const state = wrapperTraceState;
+        const probeTimeoutMs = Math.max(
+            100, Math.min(60000, Number(timeoutMs) || 5000));
         const nativeOptions = { abi: 'stdcall', exceptions: 'steal' };
         const createThread = new NativeFunction(
             Module.findExportByName('kernel32.dll', 'CreateThread'),
@@ -649,13 +651,15 @@ rpc.exports = {
                 if (resumeThread(threadHandle) === 0xffffffff) {
                     throw new Error('ResumeThread failed');
                 }
-                const waitResult = waitForSingleObject(threadHandle, 2000);
+                const waitResult = waitForSingleObject(threadHandle,
+                                                       probeTimeoutMs);
                 if (waitResult === 0) {
                     threadFinished = true;
                     state.stats.activeProbeReturns++;
                 }
                 else if (waitResult === 0x102) {
-                    throw new Error('probe timed out after 2000 ms');
+                    throw new Error(
+                        `probe timed out after ${probeTimeoutMs} ms`);
                 }
                 else {
                     throw new Error(`WaitForSingleObject failed: ${waitResult}`);
@@ -786,7 +790,7 @@ rpc.exports = {
             if (m.name != excludedModuleName) {
                 m.enumerateExports().forEach(e => {
                     if (e.type == "function" && e.hasOwnProperty('address')) {           
-                        acc.push(e);
+                        acc.push(Object.assign({}, e, { module: m.name }));
                     }
                 });
             }

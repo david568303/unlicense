@@ -40,6 +40,9 @@ small byte windows around detected import wrappers, and emulation failures. It
 does not contain the complete protected or unpacked executable. Themida 2.x
 heap-based wrappers are emulated without entering the real Windows heap, which
 allows import resolution to continue past calls such as `RtlAllocateHeap`.
+When native tracing is enabled, the report also stores per-wrapper probe
+addresses, counters, timeouts, and errors so failures can be diagnosed without
+sharing the protected executable.
 
 Exception-driven wrappers can optionally be resolved by briefly executing the
 target after its OEP under Frida Stalker:
@@ -56,25 +59,40 @@ test system where target-side effects are acceptable.
 
 If passive tracing reports `wrapper_hits=0`, the remaining wrappers were not
 executed naturally. For 32-bit targets, an experimental active probe can invoke
-each unresolved call site while the OEP thread is still blocked:
+each unresolved call site in a separate sacrificial target instance:
 
 ```powershell
 .\unlicense-win7-x86.exe .\protected-x86.exe --verbose=true --timeout=60 `
   --active_wrapper_probe=true `
+  --active_probe_timeout=5000 `
   --diagnostic_output=unlicense-diagnostics.json
 ```
 
-The active probe supplies synthetic zero-filled arguments and temporarily
-places a jump to controlled stack cleanup after each probed CALL. It restores
-the original bytes immediately afterward. Once the wrapper reaches its final
-Windows API, the tracer records the address and skips the API body instead of
-invoking it with synthetic arguments.
+The original dump target remains blocked at its OEP and is never actively
+probed. Call sites are translated to the sacrificial process by module RVA, and
+resolved exports are translated back by module and export name instead of
+assuming equal ASLR addresses. If the sacrificial process crashes, times out,
+or is terminated by an imported API, Unlicense retains the intact dump target
+and continues with a fresh sacrificial instance. Every wrapper gets a new
+process even when the previous probe appeared to succeed, preventing silent
+global-state corruption from contaminating later probes. Successful wrapper
+resolutions are committed one at a time, so a later crash cannot erase earlier
+results.
+
+Inside the sacrificial process, the probe supplies synthetic zero-filled
+arguments and temporarily places a jump to controlled stack cleanup after each
+probed CALL. It restores the original bytes immediately afterward. Once the
+wrapper reaches its final Windows API, the tracer records the address and skips
+the API body instead of invoking it with synthetic arguments.
 Intermediate APIs used internally by the wrapper still execute and may have
 side effects, so the probe remains experimental.
 Use this option only in a disposable, isolated VM snapshot. It currently
-supports 32-bit targets only. `--native_trace_timeout` may be combined with it,
-but is not required. Each active call is isolated in a probe thread and limited
-to two seconds so a non-returning wrapper does not stall the whole dump.
+supports 32-bit targets only. `--native_trace_timeout` is intentionally ignored
+while active probing is enabled so the dump target is never released from its
+OEP. Each active call is isolated in a probe thread and limited to five seconds
+by default so a non-returning wrapper does not stall the whole dump. Adjust
+`--active_probe_timeout` between 100 and 60000 milliseconds for unusually slow
+wrappers; the default is 5000 milliseconds.
 
 Unlicense is not a remote dumper: Frida starts the target locally and Scylla
 opens that local process ID.  Consequently, running Unlicense on Windows 10/11
@@ -163,6 +181,9 @@ FLAGS
     --active_wrapper_probe=ACTIVE_WRAPPER_PROBE
         Type: bool
         Default: False
+    --active_probe_timeout=ACTIVE_PROBE_TIMEOUT
+        Type: int
+        Default: 5000
 
 NOTES
     You can also use flags syntax for POSITIONAL ARGUMENTS

@@ -11,6 +11,13 @@
   counters for troubleshooting paths that were not executed.
 - Add an experimental, opt-in active probe for 32-bit exception-driven import
   wrappers that are never reached during passive tracing.
+- Run active wrapper probes in a sacrificial target instance, translate call
+  sites by image RVA, and map resolved exports back by module and name so the
+  dump target remains intact even if speculative execution crashes.
+- Commit sacrificial probe results one wrapper at a time and restart the probe
+  process for every wrapper so crashes and silent global-state corruption do
+  not affect later attempts.
+- Add a bounded, configurable timeout for each active wrapper probe.
 
 ### Fixed
 - Skip the final imported API during active wrapper probing so synthetic

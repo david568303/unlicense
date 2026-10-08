@@ -38,6 +38,7 @@ class ProcessController(abc.ABC):
         self.pointer_size = pointer_size
         self.page_size = page_size
         self._main_module_ranges: Optional[List[MemoryRange]] = None
+        self.last_wrapper_trace_stats: Optional[Dict[str, Any]] = None
 
     @abc.abstractmethod
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
@@ -63,12 +64,14 @@ class ProcessController(abc.ABC):
         """Return PE-like memory mappings when the backend supports it."""
         return []
 
-    def trace_wrapped_imports(self,
-                              wrappers: List[Dict[str, Any]],
-                              timeout_ms: int,
-                              active_probe: bool = False) -> Dict[int, int]:
+    def trace_wrapped_imports(
+            self,
+            wrappers: List[Dict[str, Any]],
+            timeout_ms: int,
+            active_probe: bool = False,
+            active_probe_timeout_ms: int = 5000) -> Dict[int, int]:
         """Resolve wrappers through native execution when supported."""
-        del wrappers, timeout_ms, active_probe
+        del wrappers, timeout_ms, active_probe, active_probe_timeout_ms
         return {}
 
     @abc.abstractmethod

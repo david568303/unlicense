@@ -1,6 +1,6 @@
 import logging
 import struct
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Any, Optional, cast
 
 from unicorn import (  # type: ignore
     Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_PROT_READ,
@@ -407,7 +407,7 @@ def _simulate_api(
 def _read_api_argument(uc: Uc, sp: int, arch: Architecture, index: int) -> int:
     if arch == Architecture.X86_32:
         argument_data = uc.mem_read(sp + 4 * (index + 1), 4)
-        return struct.unpack("<I", argument_data)[0]
+        return cast(int, struct.unpack("<I", argument_data)[0])
 
     if arch == Architecture.X86_64:
         argument_registers = [
@@ -420,7 +420,7 @@ def _read_api_argument(uc: Uc, sp: int, arch: Architecture, index: int) -> int:
 
         # Return address + 32 bytes of caller-provided shadow space.
         argument_data = uc.mem_read(sp + 0x28 + 8 * (index - 4), 8)
-        return struct.unpack("<Q", argument_data)[0]
+        return cast(int, struct.unpack("<Q", argument_data)[0])
 
     raise NotImplementedError(f"Architecture '{arch}' isn't supported")
 
@@ -432,7 +432,7 @@ def _allocate_emulated_heap(uc: Uc, requested_size: int,
     page_size = process_controller.page_size
     allocation_size = max(1, min(requested_size, MAX_EMULATED_HEAP_ALLOCATION))
     mapped_size = ((allocation_size + page_size - 1) // page_size) * page_size
-    candidate = emulation_context["heap_next"]
+    candidate = cast(int, emulation_context["heap_next"])
     candidate -= candidate % page_size
     max_address = (0xe0000000 if process_controller.architecture
                    == Architecture.X86_32 else 0x00007f0000000000)

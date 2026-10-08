@@ -3,13 +3,14 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import fire  # type: ignore
 
 from . import frida_exec, winlicense2, winlicense3
 from .dump_utils import dump_dotnet_assembly, dump_pe, get_section_ranges, interpreter_can_dump_pe, probe_text_sections
 from .logger import setup_logger
+from .process_control import ProcessController
 from .version_detection import detect_winlicense_version
 
 # Supported Themida/WinLicense major versions
@@ -32,6 +33,7 @@ def run_unlicense(
     diagnostic_output: Optional[str] = None,
     native_trace_timeout: int = 0,
     active_wrapper_probe: bool = False,
+    active_probe_timeout: int = 5000,
 ) -> None:
     """
     Unpack executables protected with Themida/WinLicense 2.x and 3.x
@@ -118,11 +120,62 @@ def run_unlicense(
                     dumped_oep, 0, 0, True)
         # Fix imports and dump the executable
         elif target_version == 2:
-            winlicense2.fix_and_dump_pe(process_controller, pe_to_dump,
-                                        dumped_image_base, dumped_oep,
-                                        text_section_range, diagnostic_output,
-                                        native_trace_timeout,
-                                        active_wrapper_probe)
+
+            def create_probe_process(
+            ) -> Tuple[Optional[ProcessController], Optional[int]]:
+                probe_oep_reached = threading.Event()
+                probe_controller: Optional[ProcessController] = None
+                probe_image_base: Optional[int] = None
+                probe_dotnet = False
+
+                def notify_probe_oep(image_base: int, _oep: int,
+                                     dotnet: bool) -> None:
+                    nonlocal probe_image_base
+                    nonlocal probe_dotnet
+                    probe_image_base = image_base
+                    probe_dotnet = dotnet
+                    probe_oep_reached.set()
+
+                LOG.warning(
+                    "Starting a sacrificial target instance for active "
+                    "wrapper probing; the dump target will remain blocked")
+                try:
+                    assert text_section_ranges is not None
+                    probe_controller = frida_exec.spawn_and_instrument(
+                        pe_path, text_section_ranges, notify_probe_oep)
+                    if not probe_oep_reached.wait(float(timeout)):
+                        LOG.warning(
+                            "Sacrificial target did not reach its OEP before "
+                            "timeout; active probing is disabled")
+                        probe_controller.terminate_process()
+                        probe_controller = None
+                        probe_image_base = None
+                    elif probe_dotnet:
+                        LOG.warning(
+                            "Sacrificial target was detected as .NET; active "
+                            "probing is disabled")
+                        probe_controller.terminate_process()
+                        probe_controller = None
+                        probe_image_base = None
+                    else:
+                        LOG.info(
+                            "Sacrificial target reached OEP: PID=%d BASE=%s",
+                            probe_controller.pid, hex(probe_image_base or 0))
+                        return probe_controller, probe_image_base
+                except Exception as error:
+                    LOG.warning("Failed to start sacrificial target: %s",
+                                error)
+                    if probe_controller is not None:
+                        probe_controller.terminate_process()
+                    probe_controller = None
+                    probe_image_base = None
+                return None, None
+
+            winlicense2.fix_and_dump_pe(
+                process_controller, pe_to_dump, dumped_image_base, dumped_oep,
+                text_section_range, diagnostic_output, native_trace_timeout,
+                active_wrapper_probe, active_probe_timeout,
+                create_probe_process if active_wrapper_probe else None)
         elif target_version == 3:
             if diagnostic_output is not None:
                 LOG.warning(

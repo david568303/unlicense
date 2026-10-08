@@ -29,6 +29,10 @@ class FakeProcessController(ProcessController):
         self.trace_results: Dict[int, int] = {}
         self.trace_timeout = 0
         self.active_probe = False
+        self.active_probe_timeout = 0
+        self.trace_wrappers: List[Dict[str, Any]] = []
+        self.trace_error: Optional[Exception] = None
+        self.terminate_count = 0
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
         return None
@@ -46,6 +50,10 @@ class FakeProcessController(ProcessController):
 
     def find_export_by_name(self, module_name: str,
                             export_name: str) -> Optional[int]:
+        for address, export in self.exports.items():
+            if (str(export.get("module", "")).lower() == module_name.lower()
+                    and export.get("name") == export_name):
+                return address
         return None
 
     def enumerate_modules(self) -> List[str]:
@@ -62,13 +70,21 @@ class FakeProcessController(ProcessController):
                                      ) -> Dict[int, Dict[str, Any]]:
         return self.exports
 
-    def trace_wrapped_imports(self,
-                              wrappers: List[Dict[str, Any]],
-                              timeout_ms: int,
-                              active_probe: bool = False) -> Dict[int, int]:
-        del wrappers
+    def trace_wrapped_imports(
+            self,
+            wrappers: List[Dict[str, Any]],
+            timeout_ms: int,
+            active_probe: bool = False,
+            active_probe_timeout_ms: int = 5000) -> Dict[int, int]:
+        self.trace_wrappers = wrappers
         self.trace_timeout = timeout_ms
         self.active_probe = active_probe
+        self.active_probe_timeout = active_probe_timeout_ms
+        self.last_wrapper_trace_stats = {
+            "activeProbes": 1 if active_probe else 0,
+        }
+        if self.trace_error is not None:
+            raise self.trace_error
         return self.trace_results
 
     def allocate_process_memory(self, size: int, near: int) -> int:
@@ -93,7 +109,7 @@ class FakeProcessController(ProcessController):
         raise NotImplementedError
 
     def terminate_process(self) -> None:
-        return None
+        self.terminate_count += 1
 
 
 def _relative_branch(opcode: int, instruction_address: int,
@@ -124,12 +140,133 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         diagnostics = _resolve_imports(imports,
                                        {(call_site, 5, False, wrapper, None)},
                                        None, exports, disassembler, controller,
-                                       250, True)
+                                       250, False)
 
         self.assertEqual([(call_site, 5, False)], imports[target_api])
         self.assertEqual("native_trace", diagnostics[0]["resolution_method"])
         self.assertEqual(250, controller.trace_timeout)
-        self.assertTrue(controller.active_probe)
+        self.assertFalse(controller.active_probe)
+
+    def test_active_trace_uses_sacrificial_process_and_translates_export(
+            self) -> None:
+        image_base = 0x400000
+        probe_image_base = 0x500000
+        call_site = 0x401000
+        wrapper = 0x402000
+        probe_call_site = 0x501000
+        probe_wrapper = 0x602000
+        main_api = 0x76002000
+        probe_api = 0x77003000
+
+        main_call_page = bytearray(0x1000)
+        main_call_page[0:5] = _relative_branch(0xe8, call_site, wrapper)
+        main_controller = FakeProcessController(
+            {
+                call_site: bytes(main_call_page),
+                wrapper: bytes([0xcc]) + bytes(0xfff),
+            }, {main_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+
+        probe_call_page = bytearray(0x1000)
+        probe_call_page[0:5] = _relative_branch(0xe8, probe_call_site,
+                                                probe_wrapper)
+        probe_controller = FakeProcessController(
+            {probe_call_site: bytes(probe_call_page)},
+            {probe_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+        probe_controller.trace_results = {probe_call_site: probe_api}
+
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+        diagnostics = _resolve_imports(
+            imports, {(call_site, 5, False, wrapper, None)}, None,
+            main_controller.exports, disassembler, main_controller, 250, True,
+            7000, image_base, lambda: (probe_controller, probe_image_base))
+
+        self.assertEqual([(call_site, 5, False)], imports[main_api])
+        self.assertEqual("sacrificial_native_trace",
+                         diagnostics[0]["resolution_method"])
+        self.assertEqual(hex(probe_call_site),
+                         diagnostics[0]["probe_call_address"])
+        self.assertEqual(hex(probe_wrapper),
+                         diagnostics[0]["probe_wrapper_address"])
+        self.assertEqual({"activeProbes": 1},
+                         diagnostics[0]["probe_trace_stats"])
+        self.assertTrue(probe_controller.active_probe)
+        self.assertEqual(7000, probe_controller.active_probe_timeout)
+        self.assertFalse(main_controller.active_probe)
+        self.assertEqual(0, main_controller.trace_timeout)
+        self.assertEqual(1, probe_controller.terminate_count)
+
+    def test_active_trace_restarts_probe_after_sacrificial_crash(self) -> None:
+        image_base = 0x400000
+        probe_image_base = 0x500000
+        first_call = 0x401000
+        second_call = 0x403000
+        first_wrapper = 0x402000
+        second_wrapper = 0x404000
+        first_probe_call = 0x501000
+        second_probe_call = 0x503000
+        first_probe_wrapper = 0x602000
+        second_probe_wrapper = 0x604000
+        main_api = 0x76002000
+        probe_api = 0x77003000
+
+        main_pages = {}
+        for call, wrapper in ((first_call, first_wrapper), (second_call,
+                                                            second_wrapper)):
+            call_page = bytearray(0x1000)
+            call_page[0:5] = _relative_branch(0xe8, call, wrapper)
+            main_pages[call] = bytes(call_page)
+            main_pages[wrapper] = bytes([0xcc]) + bytes(0xfff)
+        main_controller = FakeProcessController(
+            main_pages,
+            {main_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+
+        failed_call_page = bytearray(0x1000)
+        failed_call_page[0:5] = _relative_branch(0xe8, first_probe_call,
+                                                 first_probe_wrapper)
+        failed_probe = FakeProcessController(
+            {first_probe_call: bytes(failed_call_page)}, {})
+        failed_probe.trace_error = RuntimeError("probe process exited")
+
+        successful_call_page = bytearray(0x1000)
+        successful_call_page[0:5] = _relative_branch(0xe8, second_probe_call,
+                                                     second_probe_wrapper)
+        successful_probe = FakeProcessController(
+            {second_probe_call: bytes(successful_call_page)},
+            {probe_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+        successful_probe.trace_results = {second_probe_call: probe_api}
+        probes = iter((failed_probe, successful_probe))
+
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+        diagnostics = _resolve_imports(
+            imports, {(first_call, 5, False, first_wrapper, None),
+                      (second_call, 5, False, second_wrapper, None)}, None,
+            main_controller.exports, disassembler, main_controller, 0, True,
+            5000, image_base, lambda: (next(probes), probe_image_base))
+
+        self.assertEqual([(second_call, 5, False)], imports[main_api])
+        self.assertEqual("unresolved", diagnostics[0]["resolution_method"])
+        self.assertEqual("probe process exited", diagnostics[0]["probe_error"])
+        self.assertEqual("sacrificial_native_trace",
+                         diagnostics[1]["resolution_method"])
+        self.assertEqual(1, failed_probe.terminate_count)
+        self.assertEqual(1, successful_probe.terminate_count)
+        self.assertEqual(0, main_controller.terminate_count)
 
     def test_synthetic_heap_search_is_bounded(self) -> None:
         controller = FakeProcessController({}, {})

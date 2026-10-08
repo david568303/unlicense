@@ -2,10 +2,11 @@ import json
 import logging
 import struct
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Callable, Dict, List, Tuple, Any, Optional
 
 from capstone import (  # type: ignore
     Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64)
+from capstone.x86 import X86_OP_IMM, X86_OP_MEM  # type: ignore
 
 from .imports import ImportToCallSiteDict, WrapperSet, find_wrapped_imports
 from .dump_utils import dump_pe, pointer_size_to_fmt
@@ -17,14 +18,20 @@ from .process_control import (ProcessController, Architecture, MemoryRange,
 LOG = logging.getLogger(__name__)
 
 
-def fix_and_dump_pe(process_controller: ProcessController,
-                    pe_file_path: str,
-                    image_base: int,
-                    oep: int,
-                    text_section_range: MemoryRange,
-                    diagnostic_output: Optional[str] = None,
-                    native_trace_timeout: int = 0,
-                    active_wrapper_probe: bool = False) -> None:
+def fix_and_dump_pe(
+    process_controller: ProcessController,
+    pe_file_path: str,
+    image_base: int,
+    oep: int,
+    text_section_range: MemoryRange,
+    diagnostic_output: Optional[str] = None,
+    native_trace_timeout: int = 0,
+    active_wrapper_probe: bool = False,
+    active_probe_timeout: int = 5000,
+    probe_process_factory: Optional[Callable[[],
+                                             Tuple[Optional[ProcessController],
+                                                   Optional[int]]]] = None
+) -> None:
     """
     Main dumping routine for Themida/WinLicense 2.x.
     """
@@ -65,11 +72,10 @@ def fix_and_dump_pe(process_controller: ProcessController,
                                                 process_controller)
 
     LOG.info("Resolving imports ...")
-    wrapper_diagnostics = _resolve_imports(api_to_calls, wrapper_set,
-                                           export_hashes, exports_dict, md,
-                                           process_controller,
-                                           native_trace_timeout,
-                                           active_wrapper_probe)
+    wrapper_diagnostics = _resolve_imports(
+        api_to_calls, wrapper_set, export_hashes, exports_dict, md,
+        process_controller, native_trace_timeout, active_wrapper_probe,
+        active_probe_timeout, image_base, probe_process_factory)
     LOG.info("Imports resolved: %d", len(api_to_calls))
 
     unresolved_count = sum(1 for wrapper in wrapper_diagnostics
@@ -147,14 +153,20 @@ def _generate_export_hashes(
 
 
 def _resolve_imports(
-        api_to_calls: ImportToCallSiteDict,
-        wrapper_set: WrapperSet,
-        export_hashes: Optional[Dict[int, int]],
-        exports_dict: Dict[int, Dict[str, Any]],
-        md: Cs,
-        process_controller: ProcessController,
-        native_trace_timeout: int = 0,
-        active_wrapper_probe: bool = False) -> List[Dict[str, Any]]:
+    api_to_calls: ImportToCallSiteDict,
+    wrapper_set: WrapperSet,
+    export_hashes: Optional[Dict[int, int]],
+    exports_dict: Dict[int, Dict[str, Any]],
+    md: Cs,
+    process_controller: ProcessController,
+    native_trace_timeout: int = 0,
+    active_wrapper_probe: bool = False,
+    active_probe_timeout: int = 5000,
+    image_base: Optional[int] = None,
+    probe_process_factory: Optional[Callable[[],
+                                             Tuple[Optional[ProcessController],
+                                                   Optional[int]]]] = None
+) -> List[Dict[str, Any]]:
     """
     Resolve potential import wrappers by hash-matching or emulation.
     """
@@ -258,53 +270,208 @@ def _resolve_imports(
             record["resolution_method"] = "unresolved"
             problematic_wrappers.add(wrapper_addr)
 
-    unresolved_records = [
-        record for record in diagnostics
-        if record.get("resolved_address") is None
-    ]
-    if (native_trace_timeout > 0
-            or active_wrapper_probe) and unresolved_records:
-        trace_requests = [{
+    def apply_traced_imports(records: List[Dict[str, Any]],
+                             traced_imports: Dict[int,
+                                                  int], method: str) -> None:
+        for record in records:
+            call_addr = int(record["call_address"], 16)
+            resolved_addr = traced_imports.get(call_addr)
+            if resolved_addr is None:
+                continue
+            LOG.debug("%s resolved API: %s -> %s", method,
+                      record["wrapper_address"], hex(resolved_addr))
+            api_to_calls[resolved_addr].append(
+                (call_addr, int(record["call_size"]), bool(record["is_jump"])))
+            record_resolution(record, method, resolved_addr)
+
+    unresolved_records = sorted(
+        (record
+         for record in diagnostics if record.get("resolved_address") is None),
+        key=lambda record: int(record["call_address"], 16))
+    if (native_trace_timeout > 0 and active_wrapper_probe
+            and unresolved_records):
+        LOG.warning("Ignoring --native_trace_timeout while active probing is "
+                    "enabled so the dump target remains blocked and intact")
+    elif native_trace_timeout > 0 and unresolved_records:
+        trace_requests = _build_trace_requests(unresolved_records)
+        LOG.warning(
+            "Running the dump target for %d ms to trace %d native "
+            "wrappers", native_trace_timeout, len(trace_requests))
+        try:
+            traced_imports = process_controller.trace_wrapped_imports(
+                trace_requests, native_trace_timeout, False)
+            for record in unresolved_records:
+                record["native_trace_stats"] = \
+                    process_controller.last_wrapper_trace_stats
+        except Exception as error:
+            LOG.warning("Passive native wrapper tracing failed: %s", error)
+            traced_imports = {}
+        apply_traced_imports(unresolved_records, traced_imports,
+                             "native_trace")
+
+    unresolved_records = sorted(
+        (record
+         for record in diagnostics if record.get("resolved_address") is None),
+        key=lambda record: int(record["call_address"], 16))
+    if (active_wrapper_probe and unresolved_records
+            and arch != Architecture.X86_32):
+        LOG.warning("Active wrapper probing currently supports 32-bit targets "
+                    "only; the dump target will not be probed")
+    elif active_wrapper_probe and unresolved_records:
+        if probe_process_factory is None or image_base is None:
+            LOG.warning("Active wrapper probing was requested, but no "
+                        "sacrificial process factory is available; the dump "
+                        "target will not be probed")
+        else:
+            probe_timeout = max(100, min(60000, active_probe_timeout))
+            for index, record in enumerate(unresolved_records, 1):
+                probe_controller, probe_image_base = probe_process_factory()
+                if probe_controller is None or probe_image_base is None:
+                    record["probe_error"] = "sacrificial target unavailable"
+                    LOG.warning(
+                        "No sacrificial target is available for "
+                        "wrapper %d/%d", index, len(unresolved_records))
+                    break
+                try:
+                    probe_requests, probe_to_main_calls = \
+                        _build_probe_trace_requests(
+                            [record], image_base, probe_image_base, md,
+                            probe_controller)
+                    if not probe_requests:
+                        continue
+                    LOG.warning(
+                        "Actively probing wrapper %d/%d in the sacrificial "
+                        "target PID=%d (timeout=%d ms); the dump target "
+                        "remains untouched", index, len(unresolved_records),
+                        probe_controller.pid, probe_timeout)
+                    probe_results = probe_controller.trace_wrapped_imports(
+                        probe_requests, 0, True, probe_timeout)
+                    record["probe_trace_stats"] = \
+                        probe_controller.last_wrapper_trace_stats
+                    traced_imports = _translate_probe_results(
+                        probe_results, probe_to_main_calls, probe_controller,
+                        process_controller)
+                    apply_traced_imports([record], traced_imports,
+                                         "sacrificial_native_trace")
+                except Exception as error:
+                    record["probe_error"] = str(error)
+                    LOG.warning("Sacrificial wrapper %d/%d failed: %s", index,
+                                len(unresolved_records), error)
+                finally:
+                    # Never reuse a speculative process. A wrapper may have
+                    # corrupted global state even if its probe thread returned.
+                    probe_controller.terminate_process()
+
+    return diagnostics
+
+
+def _build_trace_requests(
+        records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    requests = []
+    for record in records:
+        prefix_size = 1 if str(record.get("call_site_bytes",
+                                          "")).startswith("90") else 0
+        call_address = int(record["call_address"], 16)
+        requests.append({
             "callAddress":
             record["call_address"],
             "wrapperAddress":
             record["wrapper_address"],
             "returnAddress":
-            hex(
-                int(record["call_address"], 16) + int(record["call_size"]) +
-                (1 if str(record.get("call_site_bytes", "")).
-                 startswith("90") else 0)),
+            hex(call_address + int(record["call_size"]) + prefix_size),
             "isJump":
             bool(record["is_jump"]),
-        } for record in unresolved_records]
-        if active_wrapper_probe:
-            LOG.warning(
-                "Actively invoking %d unresolved wrappers with synthetic "
-                "arguments; final imported API bodies will be skipped",
-                len(trace_requests))
-        if native_trace_timeout > 0:
-            LOG.warning(
-                "Running the target for %d ms to trace %d native wrappers",
-                native_trace_timeout, len(trace_requests))
+        })
+    return requests
+
+
+def _build_probe_trace_requests(
+    records: List[Dict[str, Any]],
+    image_base: int,
+    probe_image_base: int,
+    md: Cs,
+    probe_controller: ProcessController,
+) -> Tuple[List[Dict[str, Any]], Dict[int, int]]:
+    requests = []
+    probe_to_main_calls = {}
+    pointer_format = pointer_size_to_fmt(probe_controller.pointer_size)
+
+    for record in records:
+        main_call = int(record["call_address"], 16)
+        probe_call = probe_image_base + main_call - image_base
         try:
-            traced_imports = process_controller.trace_wrapped_imports(
-                trace_requests, native_trace_timeout, active_wrapper_probe)
+            call_bytes = probe_controller.read_process_memory(probe_call, 16)
+            prefix_size = 1 if call_bytes[0] == 0x90 else 0
+            instruction_address = probe_call + prefix_size
+            instruction = next(
+                md.disasm(call_bytes[prefix_size:], instruction_address), None)
+            if instruction is None or instruction.mnemonic not in ("call",
+                                                                   "jmp"):
+                raise ValueError("translated call site is not a CALL/JMP")
+            operand = instruction.operands[0]
+            if operand.type == X86_OP_IMM:
+                wrapper_address = operand.value.imm
+            elif operand.type == X86_OP_MEM:
+                pointer_address = operand.value.mem.disp & 0xffffffff
+                pointer_data = probe_controller.read_process_memory(
+                    pointer_address, probe_controller.pointer_size)
+                wrapper_address = struct.unpack(pointer_format,
+                                                pointer_data)[0]
+            else:
+                raise ValueError("unsupported translated call operand")
+
+            record["probe_call_address"] = hex(probe_call)
+            record["probe_wrapper_address"] = hex(wrapper_address)
+            requests.append({
+                "callAddress":
+                hex(probe_call),
+                "wrapperAddress":
+                hex(wrapper_address),
+                "returnAddress":
+                hex(instruction.address + instruction.size),
+                "isJump":
+                bool(record["is_jump"]),
+            })
+            probe_to_main_calls[probe_call] = main_call
         except Exception as error:
-            LOG.warning("Native wrapper tracing failed: %s", error)
-            traced_imports = {}
+            record["probe_error"] = str(error)
+            LOG.debug("Failed to translate call site %s to probe: %s",
+                      record["call_address"], error)
 
-        for record in unresolved_records:
-            call_addr = int(record["call_address"], 16)
-            resolved_addr = traced_imports.get(call_addr)
-            if resolved_addr is None:
-                continue
-            LOG.debug("Native trace resolved API: %s -> %s",
-                      record["wrapper_address"], hex(resolved_addr))
-            api_to_calls[resolved_addr].append(
-                (call_addr, int(record["call_size"]), bool(record["is_jump"])))
-            record_resolution(record, "native_trace", resolved_addr)
+    return requests, probe_to_main_calls
 
-    return diagnostics
+
+def _translate_probe_results(
+    probe_results: Dict[int, int],
+    probe_to_main_calls: Dict[int, int],
+    probe_controller: ProcessController,
+    process_controller: ProcessController,
+) -> Dict[int, int]:
+    translated = {}
+    probe_exports = probe_controller.enumerate_exported_functions()
+    main_exports = process_controller.enumerate_exported_functions()
+
+    for probe_call, probe_export_address in probe_results.items():
+        main_call = probe_to_main_calls.get(probe_call)
+        export = probe_exports.get(probe_export_address)
+        if main_call is None or export is None:
+            continue
+
+        main_export_address = None
+        module_name = export.get("module")
+        export_name = export.get("name")
+        if module_name is not None and export_name is not None:
+            main_export_address = process_controller.find_export_by_name(
+                str(module_name), str(export_name))
+        if main_export_address is None and probe_export_address in main_exports:
+            main_export_address = probe_export_address
+        if main_export_address is None:
+            LOG.debug("Failed to translate probe export %s!%s at %s",
+                      module_name, export_name, hex(probe_export_address))
+            continue
+        translated[main_call] = main_export_address
+
+    return translated
 
 
 def _write_diagnostic_report(output_path: str, pe_file_path: str,
