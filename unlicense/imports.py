@@ -26,7 +26,7 @@ def find_wrapped_imports(
     exports_dict: Dict[int, Dict[str, Any]],  #
     md: Cs,
     process_controller: ProcessController
-) -> Tuple[ImportToCallSiteDict, WrapperSet]:
+) -> Tuple[ImportToCallSiteDict, WrapperSet, WrapperSet]:
     """
     Go through a code section and try to find wrapped (or not) import calls
     and jmps by disassembling instructions and using a few basic heuristics.
@@ -40,6 +40,7 @@ def find_wrapped_imports(
     text_section_data = text_section_range.data
 
     wrapper_set: WrapperSet = set()
+    runtime_wrapper_set: WrapperSet = set()
     api_to_calls: ImportToCallSiteDict = defaultdict(list)
     i = 0
     while i < text_section_range.size:
@@ -107,6 +108,22 @@ def find_wrapped_imports(
             i += 1
             continue
 
+        # The original scanner only considered destinations outside .text.
+        # Some large Themida 2.x bundles place their import wrappers inside the
+        # restored code section. Keep those strong-pattern candidates for
+        # runtime confirmation, but never resolve or patch them statically.
+        if text_section_range.contains(call_dest):
+            is_strong_wrapper_pattern = (
+                _is_wrapped_thunk_jmp(text_section_data, i)
+                or _is_wrapped_call(text_section_data, i)
+                or _is_wrapped_tail_call(text_section_data, i))
+            if is_strong_wrapper_pattern:
+                runtime_wrapper_set.add(
+                    (instr_addr, call_size, instr_was_jmp, call_dest,
+                     ptr_addr))
+                i += call_size + 1
+                continue
+
         # Verify that the destination is outside of the .text section
         if not text_section_range.contains(call_dest):
             # Not wrapped, add it to list of "resolved wrappers"
@@ -123,7 +140,7 @@ def find_wrapped_imports(
                 continue
         i += 1
 
-    return api_to_calls, wrapper_set
+    return api_to_calls, wrapper_set, runtime_wrapper_set
 
 
 def _is_indirect_call(code_section_data: bytes, offset: int) -> bool:

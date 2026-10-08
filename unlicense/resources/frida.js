@@ -423,6 +423,11 @@ rpc.exports = {
             returnsByAddress.get(returnKey).push(wrapper);
         });
 
+        const mainModule = Process.findModuleByName(excludedModuleName);
+        if (mainModule === null) {
+            throw new Error(`Main module '${excludedModuleName}' is unavailable`);
+        }
+        const mainModuleEnd = mainModule.base.add(mainModule.size);
         const exportsByAddress = new Map();
         Process.enumerateModules().forEach(module => {
             if (module.name.toLowerCase() === excludedModuleName.toLowerCase()) {
@@ -443,6 +448,8 @@ rpc.exports = {
             activeByThread: new Map(),
             activeProbesByThread: new Map(),
             followedThreads: new Set(),
+            observedImportConflicts: new Set(),
+            observedImports: new Map(),
             resolutions: new Map(),
             wrapperRequests: wrappers,
             wrappersByAddress: wrappersByAddress,
@@ -457,8 +464,11 @@ rpc.exports = {
                 activeExportTrail: [],
                 compiledBlocks: 0,
                 exportHits: 0,
+                observedImportConflicts: 0,
+                observedImportHits: 0,
                 returnHits: 0,
                 skippedFinalApis: 0,
+                unpatchableExportReturns: 0,
                 wrapperHits: 0,
                 threadIds: []
             }
@@ -480,6 +490,83 @@ rpc.exports = {
             };
             state.resolutions.set(result.callAddress, result);
             state.activeByThread.delete(threadId);
+        }
+
+        function isInsideMainModule(address) {
+            return address.compare(mainModule.base) >= 0 &&
+                address.compare(mainModuleEnd) < 0;
+        }
+
+        // Recover only call sites with six bytes that can safely be replaced
+        // by CALL/JMP [IAT]. This covers the patterns already supported by the
+        // static Themida 2.x scanner while allowing their wrapper destination
+        // to remain inside the unusually large unpacked .text section.
+        function observeImportCall(context, exportInfo) {
+            let returnAddress;
+            let windowAddress;
+            let bytes;
+            try {
+                returnAddress = context.sp.readPointer();
+                windowAddress = returnAddress.sub(6);
+                if (!isInsideMainModule(windowAddress) ||
+                        !isInsideMainModule(returnAddress)) {
+                    return;
+                }
+                bytes = new Uint8Array(windowAddress.readByteArray(7));
+            }
+            catch (_error) {
+                return;
+            }
+
+            let callAddress = null;
+            let callSize = 0;
+            let isJump = false;
+            if (bytes[0] === 0x90 && bytes[1] === 0xe8) {
+                callAddress = windowAddress;
+                callSize = 5;
+                isJump = bytes[6] === 0xcc;
+            }
+            else if (bytes[0] === 0xff && bytes[1] === 0x15) {
+                callAddress = windowAddress;
+                callSize = 6;
+                isJump = bytes[6] === 0xcc;
+            }
+            else if (bytes[1] === 0xe8 &&
+                    (bytes[6] === 0x90 || bytes[6] === 0xcc)) {
+                callAddress = windowAddress.add(1);
+                callSize = 5;
+                isJump = bytes[6] === 0xcc;
+            }
+            else {
+                state.stats.unpatchableExportReturns++;
+                return;
+            }
+
+            const callKey = callAddress.toString();
+            if (state.observedImportConflicts.has(callKey)) {
+                return;
+            }
+            const existing = state.observedImports.get(callKey);
+            if (existing !== undefined && existing.address !== exportInfo.address) {
+                state.observedImports.delete(callKey);
+                state.observedImportConflicts.add(callKey);
+                state.stats.observedImportConflicts++;
+                return;
+            }
+            state.stats.observedImportHits++;
+            if (existing !== undefined) {
+                existing.hits++;
+                return;
+            }
+            state.observedImports.set(callKey, {
+                callAddress: callKey,
+                callSize: callSize,
+                isJump: isJump,
+                address: exportInfo.address,
+                name: exportInfo.name,
+                module: exportInfo.module,
+                hits: 1
+            });
         }
 
         function makeTraceOptions(threadId) {
@@ -523,6 +610,7 @@ rpc.exports = {
                     if (activeProbe !== undefined) {
                         iterator.putCallout(context => {
                             state.stats.exportHits++;
+                            observeImportCall(context, exportInfo);
                             const active = state.activeByThread.get(threadId);
                             if (active === undefined) {
                                 return;
@@ -563,6 +651,7 @@ rpc.exports = {
                     else {
                         iterator.putCallout(context => {
                             state.stats.exportHits++;
+                            observeImportCall(context, exportInfo);
                             const active = state.activeByThread.get(threadId);
                             if (active === undefined) {
                                 return;
@@ -823,6 +912,7 @@ rpc.exports = {
         });
         state.stats.unfollowErrors = unfollowErrors;
         const results = Array.from(state.resolutions.values());
+        const observedImports = Array.from(state.observedImports.values());
         const stats = state.stats;
 
         // Do not call Stalker.flush()/garbageCollect() here. Trace results are
@@ -831,7 +921,11 @@ rpc.exports = {
         // reclaiming the code cache for dozens of threads can hold the Frida
         // RPC dispatcher for longer than the collection deadline. The target
         // process is torn down after dumping and will reclaim that cache.
-        return { results: results, stats: stats };
+        return {
+            results: results,
+            observedImports: observedImports,
+            stats: stats
+        };
     },
     getArchitecture: function () { return Process.arch; },
     getPointerSize: function () { return Process.pointerSize; },

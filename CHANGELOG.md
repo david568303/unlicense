@@ -17,8 +17,14 @@
   the requested OEP timeout instead of an unrelated fixed ten-second limit.
 - Add a bounded JSON post-build validation report for the OEP, executable entry
   section, import directories, resources, and bundle overlay.
+- Discover executed Themida 2.x imports from exported-API return addresses
+  during native tracing. This recovers wrappers located inside a large unpacked
+  `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
+- Revalidate every dynamically observed call site on the host and only patch
+  six-byte Themida patterns with one stable export destination. Conflicting or
+  ordinary five-byte calls are preserved rather than overwritten.
 - Return native wrapper-trace results before Frida Stalker code-cache
   reclamation and scale the bounded collection deadline with the trace window.
   This prevents a successful 60-second trace of a heavily threaded bundle from

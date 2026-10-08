@@ -21,7 +21,7 @@ from unlicense.frida_exec import (FridaProcessController, _call_with_timeout,
                                   _wrapper_trace_collection_timeout)
 from unlicense.function_hashing import (compute_function_hash,
                                         EMPTY_FUNCTION_HASH)
-from unlicense.imports import ImportToCallSiteDict
+from unlicense.imports import ImportToCallSiteDict, find_wrapped_imports
 from unlicense.process_control import (Architecture, MemoryRange,
                                        ProcessController,
                                        ReadProcessMemoryError)
@@ -38,6 +38,7 @@ class FakeProcessController(ProcessController):
         self.pages = pages
         self.exports = exports
         self.trace_results: Dict[int, int] = {}
+        self.trace_observed_imports: List[Dict[str, Any]] = []
         self.trace_results_by_profile: Dict[str, Dict[int, int]] = {}
         self.trace_stats_by_profile: Dict[str, Dict[str, Any]] = {}
         self.trace_timeout = 0
@@ -119,6 +120,7 @@ class FakeProcessController(ProcessController):
             active_probe_profile, {
                 "activeProbes": 1 if active_probe else 0,
             })
+        self.last_observed_imports = self.trace_observed_imports
         if self.trace_error is not None:
             raise self.trace_error
         return self.trace_results_by_profile.get(active_probe_profile,
@@ -191,6 +193,7 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertNotIn("Stalker.flush();", collection_body)
         self.assertNotIn("Stalker.garbageCollect();", collection_body)
         self.assertIn("Stalker.unfollow(threadId)", collection_body)
+        self.assertIn("observedImports", collection_body)
 
     def test_termination_kills_tree_without_cleanup_rpc(self) -> None:
         controller = object.__new__(FridaProcessController)
@@ -330,6 +333,122 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual("native_trace", diagnostics[0]["resolution_method"])
         self.assertEqual(250, controller.trace_timeout)
         self.assertFalse(controller.active_probe)
+
+    def test_native_trace_discovers_import_inside_text_without_static_wrapper(
+            self) -> None:
+        call_site = 0x401000
+        internal_wrapper = 0x405000
+        target_api = 0x77003000
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, internal_wrapper)
+        call_page[5] = 0x90
+        controller = FakeProcessController(
+            {call_site: bytes(call_page)}, {target_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+        controller.trace_observed_imports = [{
+            "callAddress": hex(call_site),
+            "callSize": 5,
+            "isJump": False,
+            "address": hex(target_api),
+            "name": "TargetApi",
+            "module": "kernel32.dll",
+            "hits": 3,
+        }]
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        diagnostics = _resolve_imports(imports, set(), None,
+                                       controller.exports, disassembler,
+                                       controller, 250, False)
+
+        self.assertEqual([], diagnostics)
+        self.assertEqual([(call_site, 5, False)], imports[target_api])
+        self.assertEqual(1, controller.trace_call_count)
+        self.assertTrue(controller.last_observed_imports[0]["accepted"])
+
+    def test_static_scan_reserves_in_section_wrapper_for_native_confirmation(
+            self) -> None:
+        call_site = 0x401000
+        internal_wrapper = 0x401100
+        text_data = bytearray(0x1000)
+        text_data[0:5] = _relative_branch(0xe8, call_site, internal_wrapper)
+        text_data[5] = 0x90
+        text_range = MemoryRange(call_site, len(text_data), "r-x",
+                                 bytes(text_data))
+        controller = FakeProcessController({call_site: bytes(text_data)}, {})
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        imports, external, runtime = find_wrapped_imports(
+            text_range, {}, disassembler, controller)
+
+        self.assertEqual({}, imports)
+        self.assertEqual(set(), external)
+        self.assertEqual({(call_site, 5, False, internal_wrapper, None)},
+                         runtime)
+
+    def test_native_trace_resolves_executed_in_section_wrapper(self) -> None:
+        call_site = 0x401000
+        internal_wrapper = 0x405000
+        target_api = 0x77003000
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, internal_wrapper)
+        call_page[5] = 0x90
+        controller = FakeProcessController(
+            {call_site: bytes(call_page)}, {target_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+        controller.trace_results = {call_site: target_api}
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        _resolve_imports(
+            imports, set(), None, controller.exports, disassembler,
+            controller, native_trace_timeout=250,
+            runtime_wrapper_set={(call_site, 5, False, internal_wrapper,
+                                  None)})
+
+        self.assertEqual([(call_site, 5, False)], imports[target_api])
+        self.assertEqual(1, controller.trace_call_count)
+        self.assertEqual(1, controller.last_wrapper_trace_stats[
+            "runtimeCandidateResolutions"])
+
+    def test_native_trace_preserves_unpatchable_plain_five_byte_call(
+            self) -> None:
+        call_site = 0x401000
+        target_api = 0x77003000
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, target_api)
+        call_page[5] = 0x55
+        controller = FakeProcessController(
+            {call_site: bytes(call_page)}, {target_api: {
+                "name": "TargetApi",
+                "module": "kernel32.dll",
+            }})
+        controller.trace_observed_imports = [{
+            "callAddress": hex(call_site),
+            "callSize": 5,
+            "isJump": False,
+            "address": hex(target_api),
+            "name": "TargetApi",
+            "module": "kernel32.dll",
+            "hits": 1,
+        }]
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        _resolve_imports(imports, set(), None, controller.exports,
+                         disassembler, controller, 250, False)
+
+        self.assertEqual({}, imports)
+        self.assertIn("safe Themida patch window",
+                      controller.last_observed_imports[0]["rejection_reason"])
 
     def test_active_trace_uses_sacrificial_process_and_translates_export(
             self) -> None:

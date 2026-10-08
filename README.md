@@ -63,6 +63,13 @@ but its code cache is left for process teardown instead of being reclaimed
 synchronously; on heavily threaded Windows 7 bundles that reclamation could
 block Frida long enough to discard an otherwise successful trace.
 
+The same native window also discovers import call sites that actually reach a
+DLL export, even when the intermediate wrapper remains inside the unpacked
+`.text` section. Only the existing six-byte Themida patterns are accepted, and
+the host revalidates each call site before patching it. A call site observed
+with different export destinations or without enough patch space is left
+untouched and reported in the diagnostic JSON.
+
 `--native_trace_timeout` and `--active_wrapper_probe` may be combined. The
 explicit native-trace window always runs first on the dump target; a
 sacrificial instance is started afterwards only for wrappers that remain

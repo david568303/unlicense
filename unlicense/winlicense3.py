@@ -138,8 +138,8 @@ def _find_iat_from_code_sections(
     md = Cs(CS_ARCH_X86, cs_mode)
     md.detail = True
 
-    _, wrapper_set = find_wrapped_imports(text_section_range, exports_dict, md,
-                                          process_controller)
+    _, wrapper_set, _ = find_wrapped_imports(text_section_range, exports_dict,
+                                             md, process_controller)
     if len(wrapper_set) == 0:
         return None
 

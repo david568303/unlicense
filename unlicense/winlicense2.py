@@ -60,11 +60,12 @@ def fix_and_dump_pe(
     md.detail = True
 
     LOG.info("Looking for wrapped imports ...")
-    api_to_calls, wrapper_set = find_wrapped_imports(text_section_range,
-                                                     exports_dict, md,
-                                                     process_controller)
+    api_to_calls, wrapper_set, runtime_wrapper_set = find_wrapped_imports(
+        text_section_range, exports_dict, md, process_controller)
 
     LOG.info("Potential import wrappers found: %d", len(wrapper_set))
+    LOG.info("In-section wrapper candidates reserved for native tracing: %d",
+             len(runtime_wrapper_set))
     direct_import_count = len(api_to_calls)
     export_hashes = None
     # Hash-matching strategy is only needed for 32-bit PEs
@@ -77,7 +78,8 @@ def fix_and_dump_pe(
     wrapper_diagnostics = _resolve_imports(
         api_to_calls, wrapper_set, export_hashes, exports_dict, md,
         process_controller, native_trace_timeout, active_wrapper_probe,
-        active_probe_timeout, image_base, probe_process_factory)
+        active_probe_timeout, image_base, probe_process_factory,
+        runtime_wrapper_set)
     LOG.info("Imports resolved: %d", len(api_to_calls))
 
     preserved_external_count = sum(
@@ -92,8 +94,10 @@ def fix_and_dump_pe(
         if wrapper.get("resolved_address") is None and wrapper.get(
             "resolution_method") not in NON_IMPORT_RESOLUTION_METHODS)
     if unresolved_count > 0:
-        LOG.warning("Unresolved import wrappers: %d/%d. The dump may not run.",
-                    unresolved_count, len(wrapper_diagnostics))
+        LOG.warning(
+            "Unresolved suspected wrappers preserved unchanged: %d/%d. "
+            "If one is executed on a later code path, the dump may not run.",
+            unresolved_count, len(wrapper_diagnostics))
 
     if diagnostic_output is not None:
         _write_diagnostic_report(diagnostic_output, pe_file_path, image_base,
@@ -210,7 +214,8 @@ def _resolve_imports(
     image_base: Optional[int] = None,
     probe_process_factory: Optional[Callable[[],
                                              Tuple[Optional[ProcessController],
-                                                   Optional[int]]]] = None
+                                                   Optional[int]]]] = None,
+    runtime_wrapper_set: Optional[WrapperSet] = None,
 ) -> List[Dict[str, Any]]:
     """
     Resolve potential import wrappers by hash-matching or emulation.
@@ -378,16 +383,93 @@ def _resolve_imports(
                 (call_addr, int(record["call_size"]), bool(record["is_jump"])))
             record_resolution(record, method, resolved_addr)
 
+    def merge_observed_imports(observations: List[Dict[str, Any]]) -> int:
+        """Merge dynamically observed, safely patchable import call sites."""
+        existing_by_call: Dict[int, int] = {}
+        for import_addr, call_sites in api_to_calls.items():
+            for existing_call, _, _ in call_sites:
+                existing_by_call[existing_call] = import_addr
+
+        accepted = 0
+        for observation in observations:
+            observation["accepted"] = False
+            try:
+                call_addr = int(str(observation["callAddress"]), 16)
+                resolved_addr = int(str(observation["address"]), 16)
+                call_size = int(observation["callSize"])
+                instr_was_jmp = bool(observation["isJump"])
+            except (KeyError, TypeError, ValueError) as error:
+                observation["rejection_reason"] = f"invalid trace record: {error}"
+                continue
+
+            if resolved_addr not in exports_dict:
+                observation["rejection_reason"] = \
+                    "destination is not a currently loaded export"
+                continue
+
+            try:
+                call_bytes = get_data(call_addr, 7)
+            except ReadProcessMemoryError as error:
+                observation["rejection_reason"] = \
+                    f"call site is no longer readable: {error}"
+                continue
+
+            # Revalidate the exact six-byte patch window on the host. Plain
+            # five-byte E8 calls are intentionally rejected because replacing
+            # them with FF15/FF25 would overwrite the next instruction.
+            expected_size = 0
+            if call_bytes[:2] == b"\x90\xe8" and len(call_bytes) >= 7:
+                expected_size = 5
+            elif call_bytes[:2] == b"\xff\x15" and len(call_bytes) >= 7:
+                expected_size = 6
+            elif (call_bytes[:1] == b"\xe8" and len(call_bytes) >= 6
+                  and call_bytes[5] in (0x90, 0xcc)):
+                expected_size = 5
+            if expected_size == 0 or call_size != expected_size:
+                observation["rejection_reason"] = \
+                    "call site no longer has a safe Themida patch window"
+                continue
+
+            existing_addr = existing_by_call.get(call_addr)
+            if existing_addr is not None:
+                if existing_addr == resolved_addr:
+                    observation["accepted"] = True
+                    observation["duplicate"] = True
+                else:
+                    observation["rejection_reason"] = (
+                        "call site conflicts with an existing resolution to "
+                        f"{hex(existing_addr)}")
+                continue
+
+            api_to_calls[resolved_addr].append(
+                (call_addr, call_size, instr_was_jmp))
+            existing_by_call[call_addr] = resolved_addr
+            observation["accepted"] = True
+            accepted += 1
+        return accepted
+
     unresolved_records = sorted(
         (record for record in diagnostics
          if record.get("resolved_address") is None and record.get(
              "resolution_method") not in NON_IMPORT_RESOLUTION_METHODS),
         key=lambda record: int(record["call_address"], 16))
-    if native_trace_timeout > 0 and unresolved_records:
-        trace_requests = _build_trace_requests(unresolved_records)
+    if native_trace_timeout > 0:
+        runtime_records: List[Dict[str, Any]] = []
+        for (call_addr, call_size, instr_was_jmp, wrapper_addr,
+             _ptr_addr) in sorted(runtime_wrapper_set or set()):
+            runtime_records.append({
+                "call_address": hex(call_addr),
+                "call_size": call_size,
+                "is_jump": instr_was_jmp,
+                "wrapper_address": hex(wrapper_addr),
+                "call_site_bytes": diagnostic_bytes(call_addr, 16),
+            })
+        trace_requests = _build_trace_requests(unresolved_records +
+                                               runtime_records)
         LOG.warning(
-            "Running the dump target for %d ms to trace %d native "
-            "wrappers", native_trace_timeout, len(trace_requests))
+            "Running the dump target for %d ms to trace %d suspected "
+            "wrappers (%d in-section) and discover executed imports",
+            native_trace_timeout, len(trace_requests), len(runtime_records))
         try:
             traced_imports = process_controller.trace_wrapped_imports(
                 trace_requests, native_trace_timeout, False)
@@ -399,6 +481,44 @@ def _resolve_imports(
             traced_imports = {}
         apply_traced_imports(unresolved_records, traced_imports,
                              "native_trace")
+        existing_calls = {
+            call_addr: import_addr
+            for import_addr, call_sites in api_to_calls.items()
+            for call_addr, _, _ in call_sites
+        }
+        runtime_resolved = 0
+        runtime_by_call = {
+            int(record["call_address"], 16): record
+            for record in runtime_records
+        }
+        for call_addr, resolved_addr in traced_imports.items():
+            runtime_record = runtime_by_call.get(call_addr)
+            if runtime_record is None or resolved_addr not in exports_dict:
+                continue
+            existing_addr = existing_calls.get(call_addr)
+            if existing_addr is not None:
+                if existing_addr != resolved_addr:
+                    LOG.debug(
+                        "Ignoring conflicting runtime wrapper resolution at "
+                        "%s: %s vs %s", hex(call_addr), hex(existing_addr),
+                        hex(resolved_addr))
+                continue
+            api_to_calls[resolved_addr].append(
+                (call_addr, int(runtime_record["call_size"]),
+                 bool(runtime_record["is_jump"])))
+            existing_calls[call_addr] = resolved_addr
+            runtime_resolved += 1
+        if process_controller.last_wrapper_trace_stats is not None:
+            process_controller.last_wrapper_trace_stats[
+                "runtimeCandidates"] = len(runtime_records)
+            process_controller.last_wrapper_trace_stats[
+                "runtimeCandidateResolutions"] = runtime_resolved
+        LOG.info("Resolved %d in-section wrappers through native execution",
+                 runtime_resolved)
+        observed_count = merge_observed_imports(
+            process_controller.last_observed_imports)
+        LOG.info("Accepted %d dynamically observed import call sites",
+                 observed_count)
 
     unresolved_records = sorted(
         (record for record in diagnostics
@@ -625,6 +745,11 @@ def _write_diagnostic_report(output_path: str, pe_file_path: str,
         "pe_memory_candidates": pe_memory_candidates,
         "collection_errors": collection_errors,
         "direct_import_count": direct_import_count,
+        "native_observed_import_count": sum(
+            1 for observation in process_controller.last_observed_imports
+            if observation.get("accepted")),
+        "native_observed_imports": process_controller.last_observed_imports,
+        "native_trace_stats": process_controller.last_wrapper_trace_stats,
         "potential_wrapper_count": len(wrapper_diagnostics),
         "resolved_import_count": len(api_to_calls),
         "resolved_imports": resolved_imports,

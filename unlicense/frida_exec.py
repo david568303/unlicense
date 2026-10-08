@@ -133,6 +133,7 @@ class FridaProcessController(ProcessController):
             active_probe: bool = False,
             active_probe_timeout_ms: int = 5000,
             active_probe_profile: str = "zero") -> Dict[int, int]:
+        self.last_observed_imports = []
         rpc_grace_ms = 10000
         collection_grace_ms = _wrapper_trace_collection_timeout(timeout_ms)
 
@@ -162,17 +163,25 @@ class FridaProcessController(ProcessController):
         trace_data = _call_with_timeout(collect_trace, collection_grace_ms,
                                         "collect wrapper trace")
         value: List[Dict[str, Any]] = trace_data.get("results", [])
+        observed_imports: List[Dict[str, Any]] = trace_data.get(
+            "observedImports", [])
+        self.last_observed_imports = observed_imports
         stats: Optional[Dict[str, Any]] = trace_data.get("stats")
         self.last_wrapper_trace_stats = stats
         if stats is not None:
             LOG.info(
                 "Native trace stats: threads=%d blocks=%d wrapper_hits=%d "
-                "export_hits=%d return_hits=%d active_probes=%d "
-                "active_returns=%d skipped_final_apis=%d active_errors=%d",
+                "export_hits=%d return_hits=%d observed_imports=%d "
+                "observed_conflicts=%d unpatchable_exports=%d "
+                "active_probes=%d active_returns=%d skipped_final_apis=%d "
+                "active_errors=%d",
                 len(stats.get("threadIds",
                               [])), stats.get("compiledBlocks", 0),
                 stats.get("wrapperHits", 0), stats.get("exportHits", 0),
-                stats.get("returnHits", 0), stats.get("activeProbes", 0),
+                stats.get("returnHits", 0), len(observed_imports),
+                stats.get("observedImportConflicts", 0),
+                stats.get("unpatchableExportReturns", 0),
+                stats.get("activeProbes", 0),
                 stats.get("activeProbeReturns", 0),
                 stats.get("skippedFinalApis", 0),
                 len(stats.get("activeProbeErrors", [])))
@@ -183,17 +192,9 @@ class FridaProcessController(ProcessController):
             int(result["callAddress"], 16): int(result["address"], 16)
             for result in value
         }
-        # One protected wrapper may be referenced by several call sites. A
-        # successful native probe resolves all of them, even though Stalker
-        # records the first matching call site only.
-        by_wrapper = {
-            result["wrapperAddress"].lower(): int(result["address"], 16)
-            for result in value
-        }
-        for wrapper in wrappers:
-            resolved = by_wrapper.get(wrapper["wrapperAddress"].lower())
-            if resolved is not None:
-                traced[int(wrapper["callAddress"], 16)] = resolved
+        # Do not propagate one observed result to every call site sharing the
+        # same wrapper address. Dispatch wrappers can choose different exports
+        # from call-site state; only an actually executed call is authoritative.
         return traced
 
     def enumerate_module_ranges(
