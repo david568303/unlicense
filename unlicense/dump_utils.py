@@ -17,6 +17,8 @@ from .process_control import MemoryRange, ProcessController
 
 LOG = logging.getLogger(__name__)
 
+SectionFileMapping = Tuple[int, int, int, int]
+
 
 def _materialize_iat_input(process_controller: ProcessController,
                            image_base: int, iat_addr: int, iat_size: int,
@@ -29,6 +31,139 @@ def _materialize_iat_input(process_controller: ProcessController,
     pyscylla.fix_iat(process_controller.pid, image_base, iat_addr, iat_size,
                      add_new_iat, dumped_path, output_path)
     return True
+
+
+def _mapped_file_slices(section_mappings: List[SectionFileMapping], rva: int,
+                        size: int) -> List[Tuple[int, int, int]]:
+    """Map an RVA range to (file offset, source offset, size) slices."""
+    slices: List[Tuple[int, int, int]] = []
+    range_end = rva + size
+    for section_rva, virtual_size, raw_offset, raw_size in section_mappings:
+        section_end = section_rva + min(virtual_size, raw_size)
+        overlap_start = max(rva, section_rva)
+        overlap_end = min(range_end, section_end)
+        if overlap_start >= overlap_end:
+            continue
+        slices.append((raw_offset + overlap_start - section_rva,
+                       overlap_start - rva, overlap_end - overlap_start))
+    return sorted(slices, key=lambda item: item[1])
+
+
+def _overlay_pristine_data(
+    file_data: bytearray,
+    image_base: int,
+    section_mappings: List[SectionFileMapping],
+    pristine_ranges: List[MemoryRange],
+    preserved_patch_ranges: List[Tuple[int, int]],
+) -> Dict[str, int]:
+    """Restore clean OEP bytes while retaining rebuilt import references."""
+    preserved_patches: List[Tuple[List[Tuple[int, int, int]], bytes]] = []
+    for patch_address, patch_size in preserved_patch_ranges:
+        patch_rva = patch_address - image_base
+        slices = _mapped_file_slices(section_mappings, patch_rva, patch_size)
+        if sum(item[2] for item in slices) != patch_size:
+            continue
+        patch_buffer = bytearray(patch_size)
+        for file_offset, source_offset, slice_size in slices:
+            patch_buffer[source_offset:source_offset + slice_size] = \
+                file_data[file_offset:file_offset + slice_size]
+        preserved_patches.append((slices, bytes(patch_buffer)))
+
+    restored_bytes = 0
+    restored_ranges = 0
+    for memory_range in pristine_ranges:
+        if memory_range.data is None or memory_range.size <= 0:
+            continue
+        range_rva = memory_range.base - image_base
+        slices = _mapped_file_slices(section_mappings, range_rva,
+                                     memory_range.size)
+        range_bytes = 0
+        for file_offset, source_offset, slice_size in slices:
+            file_data[file_offset:file_offset + slice_size] = \
+                memory_range.data[source_offset:source_offset + slice_size]
+            range_bytes += slice_size
+        if range_bytes:
+            restored_ranges += 1
+            restored_bytes += range_bytes
+
+    for slices, saved_patch in preserved_patches:
+        for file_offset, source_offset, slice_size in slices:
+            file_data[file_offset:file_offset + slice_size] = \
+                saved_patch[source_offset:source_offset + slice_size]
+
+    return {
+        "restored_ranges": restored_ranges,
+        "restored_bytes": restored_bytes,
+        "preserved_rebuilt_regions": len(preserved_patches),
+    }
+
+
+def _restore_pristine_ranges_in_dump(
+    dumped_path: str,
+    image_base: int,
+    pristine_ranges: List[MemoryRange],
+    preserved_patch_ranges: List[Tuple[int, int]],
+) -> Dict[str, int]:
+    """Replace late runtime state in a dump with the clean OEP snapshot."""
+    empty_result = {
+        "restored_ranges": 0,
+        "restored_bytes": 0,
+        "preserved_rebuilt_regions": 0,
+    }
+    if not pristine_ranges:
+        return empty_result
+
+    binary = lief.PE.parse(dumped_path)
+    if binary is None:
+        LOG.warning("Could not parse the IAT-fixed dump for runtime-state "
+                    "restoration")
+        return empty_result
+    section_mappings: List[SectionFileMapping] = [
+        (int(section.virtual_address), int(section.virtual_size),
+         int(section.offset), int(section.size))
+        for section in lief_pe_sections(binary)
+    ]
+    protected_ranges = list(preserved_patch_ranges)
+    protected_sections = set()
+    for directory in lief_pe_data_directories(binary):
+        if directory.type not in (lief.PE.DATA_DIRECTORY.IMPORT_TABLE,
+                                  lief.PE.DATA_DIRECTORY.IAT):
+            continue
+        if int(directory.rva) == 0:
+            continue
+        directory_section = directory.section
+        if directory_section is not None:
+            section_key = (int(directory_section.virtual_address),
+                           int(directory_section.size))
+            if section_key in protected_sections:
+                continue
+            protected_sections.add(section_key)
+            protected_ranges.append(
+                (image_base + int(directory_section.virtual_address),
+                 int(directory_section.size)))
+        elif int(directory.size) > 0:
+            protected_ranges.append(
+                (image_base + int(directory.rva), int(directory.size)))
+    del binary
+
+    try:
+        with open(dumped_path, "rb") as dumped_file:
+            file_data = bytearray(dumped_file.read())
+        result = _overlay_pristine_data(file_data, image_base,
+                                        section_mappings, pristine_ranges,
+                                        protected_ranges)
+        if result["restored_bytes"]:
+            with open(dumped_path, "wb") as dumped_file:
+                dumped_file.write(file_data)
+            LOG.info(
+                "Restored %d clean OEP bytes across %d image sections while "
+                "preserving %d rebuilt import regions",
+                result["restored_bytes"], result["restored_ranges"],
+                result["preserved_rebuilt_regions"])
+        return result
+    except OSError as error:
+        LOG.warning("Failed to restore clean OEP image state: %s", error)
+        return empty_result
 
 
 def get_section_ranges(pe_file_path: str) -> List[MemoryRange]:
@@ -85,6 +220,8 @@ def dump_pe(
     iat_addr: int,
     iat_size: int,
     add_new_iat: bool,
+    pristine_ranges: Optional[List[MemoryRange]] = None,
+    preserved_patch_ranges: Optional[List[Tuple[int, int]]] = None,
 ) -> bool:
     # Reclaim as much memory as possible. This is kind of a hack for 32-bit
     # interpreters not to run out of memory when dumping.
@@ -96,6 +233,11 @@ def dump_pe(
     effective_iat_size = iat_size
     effective_add_new_iat = add_new_iat
     iat_strategy = "recovered"
+    runtime_state_restoration = {
+        "restored_ranges": 0,
+        "restored_bytes": 0,
+        "preserved_rebuilt_regions": 0,
+    }
     if effective_iat_size == 0:
         iat_strategy = "preserved_dump"
         LOG.warning(
@@ -131,6 +273,11 @@ def dump_pe(
             effective_iat_size = 0
             iat_strategy = "preserved_after_iat_failure"
 
+        if pristine_ranges:
+            runtime_state_restoration = _restore_pristine_ranges_in_dump(
+                TMP_FILE_PATH2, image_base, pristine_ranges,
+                preserved_patch_ranges or [])
+
         # All remaining operations are file-only.  Keeping a heavily packed
         # GUI target alive while Scylla and LIEF rebuild the dump wastes CPU,
         # lets it spawn children, and makes a slow rebuild look like a target
@@ -161,6 +308,7 @@ def dump_pe(
         validation["iat_reconstruction_strategy"] = iat_strategy
         validation["runtime_iat_address"] = hex(effective_iat_addr)
         validation["runtime_iat_size"] = effective_iat_size
+        validation["runtime_state_restoration"] = runtime_state_restoration
         validation_path = f"{output_file_name}.validation.json"
         try:
             with open(validation_path, "w", encoding="utf-8") as report_file:

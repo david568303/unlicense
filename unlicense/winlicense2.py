@@ -32,7 +32,8 @@ def fix_and_dump_pe(
     active_probe_timeout: int = 5000,
     probe_process_factory: Optional[Callable[[],
                                              Tuple[Optional[ProcessController],
-                                                   Optional[int]]]] = None
+                                                   Optional[int]]]] = None,
+    image_section_ranges: Optional[List[MemoryRange]] = None,
 ) -> None:
     """
     Main dumping routine for Themida/WinLicense 2.x.
@@ -45,6 +46,40 @@ def fix_and_dump_pe(
                                                text_section_range.size))
     assert text_section_range.data is not None
     LOG.debug(".text section: %s", str(text_section_range))
+
+    # Native tracing deliberately lets the protected application run so its
+    # real imports can be observed.  Dumping that late image directly also
+    # serializes process-specific heaps, linked lists, locks, and handles.  On
+    # restart those stale values can crash before the application recreates
+    # them.  Keep a pristine image snapshot from the blocked OEP and overlay it
+    # onto the final dump after Scylla has rebuilt the imports.
+    pristine_ranges: List[MemoryRange] = []
+    if native_trace_timeout > 0:
+        ranges_to_capture = image_section_ranges or []
+        if not ranges_to_capture:
+            ranges_to_capture = [
+                MemoryRange(text_section_range.base - image_base,
+                            text_section_range.size,
+                            text_section_range.protection)
+            ]
+        for section_range in ranges_to_capture:
+            section_base = image_base + section_range.base
+            try:
+                if (section_base == text_section_range.base
+                        and section_range.size == text_section_range.size):
+                    section_data = text_section_range.data
+                else:
+                    section_data = process_controller.read_process_memory(
+                        section_base, section_range.size)
+                pristine_ranges.append(
+                    MemoryRange(section_base, section_range.size,
+                                section_range.protection, section_data))
+            except ReadProcessMemoryError as error:
+                LOG.debug("Could not snapshot image section at %s: %s",
+                          hex(section_base), error)
+        LOG.info("Captured clean OEP state for %d image sections (%d bytes)",
+                 len(pristine_ranges),
+                 sum(memory_range.size for memory_range in pristine_ranges))
 
     arch = process_controller.architecture
     exports_dict = process_controller.enumerate_exported_functions()
@@ -121,8 +156,11 @@ def fix_and_dump_pe(
                         "IAT")
 
         LOG.info("Dumping PE with OEP=%s ...", hex(oep))
+        preserved_patch_ranges = [(call_address, 6)
+                                  for call_sites in api_to_calls.values()
+                                  for call_address, _, _ in call_sites]
         dump_pe(process_controller, pe_file_path, image_base, oep, iat_addr,
-                iat_size, True)
+                iat_size, True, pristine_ranges, preserved_patch_ranges)
     except Exception as error:
         LOG.error(
             "Dump target became unavailable before PE reconstruction: "

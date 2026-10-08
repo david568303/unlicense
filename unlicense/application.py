@@ -152,7 +152,8 @@ def run_unlicense(
                 process_controller, pe_to_dump, dumped_image_base, dumped_oep,
                 text_section_range, diagnostic_output, native_trace_timeout,
                 active_wrapper_probe, active_probe_timeout,
-                create_probe_process if active_wrapper_probe else None)
+                create_probe_process if active_wrapper_probe else None,
+                image_section_ranges=section_ranges)
         elif target_version == 3:
             if diagnostic_output is not None:
                 LOG.warning(

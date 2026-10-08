@@ -16,7 +16,8 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore
 from unlicense.application import (_create_primary_process,
                                    _create_probe_process, _normalize_cli_bool,
                                    _wait_for_event_with_progress)
-from unlicense.dump_utils import (dump_pe, _materialize_iat_input, _resize_pe)
+from unlicense.dump_utils import (dump_pe, _materialize_iat_input,
+                                  _overlay_pristine_data, _resize_pe)
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
 from unlicense.frida_exec import (FridaProcessController, _call_with_timeout,
                                   _wrapper_trace_collection_timeout)
@@ -383,6 +384,26 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         fix_iat.assert_called_once_with(controller.pid, 0x400000, 0x6400000,
                                         0x80, True, "dumped.exe",
                                         "fixed.exe")
+
+    def test_pristine_oep_overlay_preserves_rebuilt_import_patch(self) -> None:
+        image_base = 0x400000
+        file_data = bytearray(b"H" * 0x200 + b"L" * 0x100 + b"T" * 0x100)
+        rebuilt_patch = bytes.fromhex("ff1510204000")
+        file_data[0x220:0x226] = rebuilt_patch
+        pristine = MemoryRange(0x401000, 0x100, "r-x", b"P" * 0x100)
+
+        result = _overlay_pristine_data(
+            file_data, image_base, [(0x1000, 0x100, 0x200, 0x100)],
+            [pristine], [(0x401020, 6)])
+
+        self.assertEqual(b"P" * 0x20, file_data[0x200:0x220])
+        self.assertEqual(rebuilt_patch, file_data[0x220:0x226])
+        self.assertEqual(b"P" * (0x100 - 0x26), file_data[0x226:0x300])
+        self.assertEqual({
+            "restored_ranges": 1,
+            "restored_bytes": 0x100,
+            "preserved_rebuilt_regions": 1,
+        }, result)
 
     def test_native_trace_result_resolves_exception_wrapper(self) -> None:
         call_site = 0x401000

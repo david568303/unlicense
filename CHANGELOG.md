@@ -22,6 +22,11 @@
   `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
+- Preserve a clean snapshot of every PE section at the blocked OEP when native
+  tracing is enabled. After import reconstruction, restore that snapshot in
+  the output while retaining the rebuilt IAT call sites. This prevents late
+  tracing from serializing stale heap pointers, locks, handles, and linked-list
+  state into the executable.
 - Recover six-byte frame-relative import calls such as `FF 95 disp32`
   (`CALL [EBP+disp32]`) observed in Themida's runtime sections. They are now
   safely rewritten in place as `FF 15 [IAT]`, including call sites outside the
