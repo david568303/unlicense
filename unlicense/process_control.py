@@ -40,6 +40,7 @@ class ProcessController(abc.ABC):
         self._main_module_ranges: Optional[List[MemoryRange]] = None
         self.last_wrapper_trace_stats: Optional[Dict[str, Any]] = None
         self.last_observed_imports: List[Dict[str, Any]] = []
+        self.last_materialized_modules: List[Dict[str, Any]] = []
 
     @abc.abstractmethod
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:

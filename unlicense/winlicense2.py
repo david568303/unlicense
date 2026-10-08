@@ -15,6 +15,7 @@ from .emulation import resolve_wrapped_api
 from .function_hashing import compute_function_hash, EMPTY_FUNCTION_HASH
 from .process_control import (ProcessController, Architecture, MemoryRange,
                               ReadProcessMemoryError)
+from .runtime_modules import materialize_loaded_runtime_modules
 
 LOG = logging.getLogger(__name__)
 NON_IMPORT_RESOLUTION_METHODS = {"internal_call", "external_code_target"}
@@ -215,6 +216,13 @@ def fix_and_dump_pe(
         active_probe_timeout, image_base, probe_process_factory,
         runtime_wrapper_set)
     LOG.info("Imports resolved: %d", len(api_to_calls))
+
+    # Bundled DLLs may be materialized only while the protected process is
+    # alive and removed again during teardown. Preserve local modules now,
+    # before dump_pe terminates the initialized target.
+    process_controller.last_materialized_modules = \
+        materialize_loaded_runtime_modules(process_controller, pe_file_path,
+                                           output_file_path)
 
     preserved_external_count = sum(
         1 for wrapper in wrapper_diagnostics
@@ -907,6 +915,8 @@ def _write_diagnostic_report(output_path: str, pe_file_path: str,
         },
         "loaded_modules": loaded_modules,
         "pe_memory_candidates": pe_memory_candidates,
+        "materialized_runtime_modules":
+        process_controller.last_materialized_modules,
         "collection_errors": collection_errors,
         "direct_import_count": direct_import_count,
         "native_observed_import_count": sum(

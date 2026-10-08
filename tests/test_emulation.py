@@ -28,6 +28,8 @@ from unlicense.imports import ImportToCallSiteDict, find_wrapped_imports
 from unlicense.process_control import (Architecture, MemoryRange,
                                        ProcessController,
                                        ReadProcessMemoryError)
+from unlicense.runtime_modules import (materialize_loaded_runtime_modules,
+                                       reconstruct_mapped_module)
 from unlicense.winlicense2 import (_generate_export_hashes,
                                    _generate_new_iat_in_process,
                                    _fix_import_references_in_process,
@@ -62,6 +64,7 @@ class FakeProcessController(ProcessController):
         self.protections: Dict[int, str] = {}
         self.protection_changes: List[Tuple[int, int, str]] = []
         self.memory_writes: List[Tuple[int, List[int]]] = []
+        self.loaded_modules = ["fixture.exe", "ntdll.dll", "kernel32.dll"]
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
         return self.module_addresses.get(address)
@@ -93,7 +96,7 @@ class FakeProcessController(ProcessController):
         return None
 
     def enumerate_modules(self) -> List[str]:
-        return ["fixture.exe", "ntdll.dll", "kernel32.dll"]
+        return self.loaded_modules
 
     def enumerate_module_ranges(
             self,
@@ -195,6 +198,29 @@ def _themida_load_library_family_fixture() -> bytes:
                 marker + bytes.fromhex("5b5ac9c20c00"))
 
     return simple(1) + simple(2) + extended(3) + extended(4)
+
+
+def _mapped_runtime_dll_fixture() -> bytes:
+    image = bytearray(0x3000)
+    image[:2] = b"MZ"
+    struct.pack_into("<I", image, 0x3c, 0x80)
+    image[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", image, 0x84, 0x14c, 1, 0, 0, 0, 0xe0,
+                     0x210e)
+    optional = 0x98
+    struct.pack_into("<H", image, optional, 0x10b)
+    struct.pack_into("<I", image, optional + 16, 0x1000)
+    struct.pack_into("<I", image, optional + 28, 0x400000)
+    struct.pack_into("<I", image, optional + 32, 0x1000)
+    struct.pack_into("<I", image, optional + 36, 0x200)
+    struct.pack_into("<I", image, optional + 56, 0x3000)
+    struct.pack_into("<I", image, optional + 60, 0x200)
+    section = optional + 0xe0
+    image[section:section + 8] = b".text\0\0\0"
+    struct.pack_into("<IIII", image, section + 8, 0x1000, 0x1000,
+                     0x1000, 0x200)
+    image[0x1200:0x1210] = bytes(range(16))
+    return bytes(image)
 
 
 class HeapWrapperEmulationTests(unittest.TestCase):
@@ -405,6 +431,66 @@ class HeapWrapperEmulationTests(unittest.TestCase):
 
             self.assertTrue(result)
             self.assertEqual(str(output), fix_pe.call_args.args[1])
+
+    def test_loaded_bundled_dll_is_copied_before_target_teardown(self) -> None:
+        controller = FakeProcessController({}, {})
+        controller.main_module_name = "Titanium.exe"
+        controller.loaded_modules.append("smartkey.dll")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected = root / "protected"
+            runtime = root / "runtime"
+            protected.mkdir()
+            runtime.mkdir()
+            source = protected / "smartkey.dll"
+            source.write_bytes(b"licensed runtime module")
+            controller.module_names["smartkey.dll"] = {
+                "name": "smartkey.dll",
+                "base": "0x7300000",
+                "path": str(source),
+            }
+
+            results = materialize_loaded_runtime_modules(
+                controller, str(protected / "Titanium.exe"),
+                str(runtime / "Titanium.exe"))
+
+            self.assertEqual(b"licensed runtime module",
+                             (runtime / "smartkey.dll").read_bytes())
+            self.assertEqual("copied", results[0]["status"])
+
+    def test_deleted_bundled_dll_is_reconstructed_from_memory(self) -> None:
+        mapped = _mapped_runtime_dll_fixture()
+        load_base = 0x7300000
+        pages = {
+            load_base + offset: mapped[offset:offset + 0x1000]
+            for offset in range(0, len(mapped), 0x1000)
+        }
+        controller = FakeProcessController(pages, {})
+        controller.main_module_name = "Titanium.exe"
+        controller.loaded_modules.append("smartkey.dll")
+        controller.module_names["smartkey.dll"] = {
+            "name": "smartkey.dll",
+            "base": hex(load_base),
+            "path": None,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected = root / "protected"
+            runtime = root / "runtime"
+            protected.mkdir()
+            runtime.mkdir()
+
+            results = materialize_loaded_runtime_modules(
+                controller, str(protected / "Titanium.exe"),
+                str(runtime / "Titanium.exe"))
+            output = (runtime / "smartkey.dll").read_bytes()
+
+            self.assertEqual(b"MZ", output[:2])
+            self.assertEqual(bytes(range(16)), output[0x400:0x410])
+            self.assertEqual(load_base,
+                             struct.unpack_from("<I", output, 0xb4)[0])
+            self.assertEqual("reconstructed_from_memory",
+                             results[0]["status"])
 
     def test_zero_iat_preserves_unmodified_memory_dump(self) -> None:
         controller = FakeProcessController({}, {})

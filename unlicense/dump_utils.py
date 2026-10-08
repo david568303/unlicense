@@ -379,6 +379,8 @@ def dump_pe(
         validation["neutralized_vm_state_guards"] = [
             hex(rva) for rva in neutralized_vm_state_guards
         ]
+        validation["materialized_runtime_modules"] = \
+            process_controller.last_materialized_modules
         validation_path = f"{output_file_name}.validation.json"
         try:
             with open(validation_path, "w", encoding="utf-8") as report_file:

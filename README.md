@@ -53,6 +53,13 @@ the target's normal DLLs, license files, and data before running the result.
 Unlicense refuses to overwrite either the protected input or an existing file
 at the identity-preserving output path.
 
+When native tracing causes a bundled local DLL to appear only temporarily,
+Unlicense preserves it before terminating the initialized target. If its
+backing file has already been removed, the tool reconstructs the named DLL
+from its mapped PE sections. The diagnostic and validation JSON reports list
+each `materialized_runtime_modules` result as copied, reconstructed, already
+present, or failed.
+
 The optional diagnostic report contains PE metadata, loaded-module names,
 small byte windows around detected import wrappers, and emulation failures. It
 does not contain the complete protected or unpacked executable. Themida 2.x
