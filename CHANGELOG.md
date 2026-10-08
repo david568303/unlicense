@@ -49,6 +49,9 @@
   internal calls instead of corrupting them into fake imports.
 - Use separate Scylla input/output paths and preserve the original PE overlay
   after LIEF rebuilding so appended bundle payloads are not truncated.
+- Keep post-`NtProtectVirtualMemory` OEP rearming isolated to sacrificial
+  targets and remove execute permission only, preventing the primary target
+  from faulting while Themida is still preparing its code section.
 
 ## [0.4.0] - 2023-08-14
 ### Added

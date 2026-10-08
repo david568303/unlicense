@@ -200,7 +200,11 @@ def _create_probe_process(
             "probing; the dump target remains blocked", attempt, attempts)
         try:
             controller = frida_exec.spawn_and_instrument(
-                pe_path, text_section_ranges, notify_oep, setup_timeout_ms)
+                pe_path,
+                text_section_ranges,
+                notify_oep,
+                setup_timeout_ms,
+                post_protect_oep_rearm=True)
             reached = _wait_for_event_with_progress(
                 oep_reached, startup_wait_seconds,
                 f"sacrificial target attempt {attempt}/{attempts}")

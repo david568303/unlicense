@@ -156,11 +156,17 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         first = FakeProcessController({}, {})
         second = FakeProcessController({}, {})
         launches = 0
+        rearm_modes: List[bool] = []
 
-        def spawn(_path: Path, _ranges: List[MemoryRange], callback: Any,
-                  _timeout_ms: int) -> FakeProcessController:
+        def spawn(
+                _path: Path,
+                _ranges: List[MemoryRange],
+                callback: Any,
+                _timeout_ms: int,
+                post_protect_oep_rearm: bool = False) -> FakeProcessController:
             nonlocal launches
             launches += 1
+            rearm_modes.append(post_protect_oep_rearm)
             if launches == 1:
                 return first
             callback(0x500000, 0x501000, False)
@@ -176,6 +182,7 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual(0x500000, image_base)
         self.assertEqual(1, first.terminate_count)
         self.assertEqual(0, second.terminate_count)
+        self.assertEqual([True, True], rearm_modes)
 
     def test_rebuilt_pe_preserves_original_bundle_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

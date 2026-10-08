@@ -69,12 +69,16 @@ function isDotNetProcess() {
     return Process.findModuleByName("clr.dll") != null;
 }
 
-function makeOepRangesInaccessible(dumpedModule, expectedOepRanges) {
-    // Ensure potential OEP ranges are not accessible
+function makeOepRangesInaccessible(dumpedModule, expectedOepRanges,
+                                   protection) {
+    // Ensure potential OEP ranges cannot execute. The legacy main-target path
+    // uses '---'. Sacrificial instances use 'rw-' after NtProtect returns so
+    // the unpacker can still finish reading and writing the section.
+    const requestedProtection = protection === undefined ? '---' : protection;
     expectedOepRanges.forEach((oepRange) => {
         const sectionStart = dumpedModule.base.add(oepRange[0]);
         const expectedSectionSize = oepRange[1];
-        Memory.protect(sectionStart, expectedSectionSize, '---');
+        Memory.protect(sectionStart, expectedSectionSize, requestedProtection);
         originalPageProtections.set(sectionStart.toString(), expectedSectionSize);
     });
 }
@@ -255,11 +259,16 @@ function skipDllEntryPoint(exceptionCtx) {
 
 // Define available RPCs
 rpc.exports = {
-    setupOepTracing: function (moduleName, expectedOepRanges) {
+    setupOepTracing: function (moduleName, expectedOepRanges,
+                               postProtectRearm) {
         log(`Setting up OEP tracing for "${moduleName}"`);
 
         let targetIsDll = moduleName.endsWith(".dll");
         let dumpedModule = null;
+        const usePostProtectRearm = postProtectRearm === true;
+        log(`OEP rearm mode: ${usePostProtectRearm
+            ? 'sacrificial post-protect (rw-)'
+            : 'primary legacy (pre-protect)'}`);
 
         initializeTrampolines();
 
@@ -295,6 +304,23 @@ rpc.exports = {
                     }
                     try {
                         const address = args[1].readPointer();
+                        if (!usePostProtectRearm) {
+                            // Preserve the proven behavior for the primary
+                            // dump target. The syscall immediately restores
+                            // the requested protection, which avoids changing
+                            // its unpacking timeline.
+                            if (address.equals(dumpedModule.base)) {
+                                makeOepRangesInaccessible(
+                                    dumpedModule, expectedOepRanges);
+                                if (!exceptionHandlerRegistered) {
+                                    registerExceptionHandler(
+                                        dumpedModule, expectedOepRanges,
+                                        targetIsDll);
+                                    exceptionHandlerRegistered = true;
+                                }
+                            }
+                            return;
+                        }
                         const size = args[2].readPointer().toUInt32();
                         this.rearmOep = overlapsExpectedOepRange(
                             dumpedModule, expectedOepRanges, address, size);
@@ -304,7 +330,8 @@ rpc.exports = {
                     }
                 },
                 onLeave: function (_retval) {
-                    if (!this.rearmOep || dumpedModule == null ||
+                    if (!usePostProtectRearm || !this.rearmOep ||
+                            dumpedModule == null ||
                             oepReached || reprotectingOep) {
                         return;
                     }
@@ -313,8 +340,8 @@ rpc.exports = {
                     // immediately overwrites our protection change.
                     reprotectingOep = true;
                     try {
-                        makeOepRangesInaccessible(dumpedModule,
-                                                  expectedOepRanges);
+                        makeOepRangesInaccessible(
+                            dumpedModule, expectedOepRanges, 'rw-');
                         if (!exceptionHandlerRegistered) {
                             registerExceptionHandler(
                                 dumpedModule, expectedOepRanges, targetIsDll);
