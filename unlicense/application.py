@@ -109,23 +109,13 @@ def run_unlicense(
         elif target_version == 2:
             assert text_section_ranges is not None
             probe_ranges = text_section_ranges
-            known_oep_rva = dumped_oep - dumped_image_base
-            known_oep_bytes: Optional[bytes]
-            try:
-                known_oep_bytes = process_controller.read_process_memory(
-                    dumped_oep, 16)
-            except Exception as error:
-                LOG.warning("Failed to capture OEP verification bytes: %s",
-                            error)
-                known_oep_bytes = None
 
             def create_probe_process(
             ) -> Tuple[Optional[ProcessController], Optional[int]]:
                 return _create_probe_process(
                     pe_path, probe_ranges, max(10.0, float(timeout)),
                     max(15000, min(60000, active_probe_timeout * 2)),
-                    active_probe_startup_retries, known_oep_rva,
-                    known_oep_bytes)
+                    active_probe_startup_retries)
 
             winlicense2.fix_and_dump_pe(
                 process_controller, pe_to_dump, dumped_image_base, dumped_oep,
@@ -247,7 +237,10 @@ def _create_probe_process(
                 text_section_ranges,
                 notify_oep,
                 setup_timeout_ms,
-                post_protect_oep_rearm=True)
+                # Passive tracing must install Stalker while the clone is
+                # blocked at its real OEP. Adopting an already-open process is
+                # too late because its startup wrappers have already run.
+                post_protect_oep_rearm=False)
             reached, verified_base = _wait_for_probe_ready(
                 controller, pe_path.name, oep_reached, startup_wait_seconds,
                 attempt, attempts, known_oep_rva, known_oep_bytes)

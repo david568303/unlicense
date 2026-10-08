@@ -57,9 +57,8 @@ The native fallback is disabled by default because it lets the target execute
 normally for the requested number of milliseconds. Use it only in an isolated
 test system where target-side effects are acceptable.
 
-If passive tracing reports `wrapper_hits=0`, the remaining wrappers were not
-executed naturally. For 32-bit targets, an experimental active probe can invoke
-each unresolved call site in a separate sacrificial target instance:
+If tracing the dump target is undesirable, 32-bit targets can instead trace
+the normal startup path in one sacrificial target instance:
 
 ```powershell
 .\unlicense-win7-x86.exe .\protected-x86.exe --verbose=true --timeout=60 `
@@ -68,45 +67,23 @@ each unresolved call site in a separate sacrificial target instance:
   --diagnostic_output=unlicense-diagnostics.json
 ```
 
-The original dump target remains blocked at its OEP and is never actively
-probed. Call sites are translated to the sacrificial process by module RVA, and
-resolved exports are translated back by module and export name instead of
-assuming equal ASLR addresses. A contained per-wrapper timeout terminates only
-the synthetic probe thread and reuses the already prepared sacrificial target,
-avoiding repeated OEP initialization and multi-instance stalls. If the process
-or a Frida RPC fails, Unlicense discards that instance and starts a fresh one
-for the next wrapper. Successful wrapper resolutions are committed one at a
-time, so a later crash cannot erase earlier results.
+The dump target remains blocked at its OEP. All unresolved wrapper addresses
+are translated to the clone by module RVA, Stalker is installed once, and the
+clone is released for the requested window so the program reaches APIs through
+its genuine exception handlers and arguments. Resolved exports are translated
+back by module and name instead of assuming equal ASLR addresses. No wrapper is
+called from a synthetic thread and only one clone is live at a time.
 
-Inside the sacrificial process, the probe supplies synthetic zero-filled
-arguments first, then retries unresolved wrappers with readable-pointer and
-mixed-value profiles. It temporarily places a jump to controlled stack cleanup
-after each probed CALL and restores the original bytes immediately afterward.
-Once the wrapper reaches its final Windows API, the tracer records the address
-and skips the API body instead of invoking it with synthetic arguments.
-Intermediate APIs used internally by the wrapper still execute and may have
-side effects, so the probe remains experimental.
-Use this option only in a disposable, isolated VM snapshot. It currently
-supports 32-bit targets only. `--native_trace_timeout` is intentionally ignored
-while active probing is enabled so the dump target is never released from its
-OEP. Each active call is isolated in a probe thread and limited to five seconds
-by default so a non-returning wrapper does not stall the whole dump. Adjust
-`--active_probe_timeout` between 100 and 60000 milliseconds for unusually slow
-wrappers; the default is 5000 milliseconds. Host-side deadlines also protect
-OEP setup, trace setup, and trace collection if the injected agent itself stops
-replying. Sacrificial startup uses the main `--timeout` budget, reports progress
-every five seconds, and retries twice by default; use
-`--active_probe_startup_retries=0` to disable those retries. The diagnostic JSON
-records each argument-profile attempt, its errors, and the last 64 exports
-reached by the active probe.
-
-On 32-bit Windows 7 processes without effective DEP, removing execute
-permission may not generate an OEP event. In that case Unlicense compares the
-known OEP bytes from the blocked dump target with the same module RVA in the
-sacrificial process. A matching live instance is adopted as already unpacked;
-translated CALL/JMP sites are still decoded and checked before any wrapper is
-probed. The primary target also retries once by default when early WinLicense
-startup is intermittent. Set `--oep_startup_retries=0` to disable that retry.
+`--active_probe_timeout` controls the natural-execution window (100 to 60000
+milliseconds, default 5000). Sacrificial startup uses the main `--timeout`
+budget and retries twice by default; use
+`--active_probe_startup_retries=0` to disable retries. Cleanup does not depend
+on a responsive Frida script: Unlicense force-terminates the clone and its child
+process tree first, preventing timed-out RPCs from leaving instances behind.
+Use this option only in a disposable, isolated VM snapshot because the clone
+executes normally during the trace window. The primary target also retries once
+by default when early WinLicense startup is intermittent; set
+`--oep_startup_retries=0` to disable that retry.
 
 The rebuilt output preserves the original executable overlay, which is
 important for single-file bundles that append DLLs or metadata after the PE

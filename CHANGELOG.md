@@ -9,33 +9,28 @@
 - Add an opt-in native Frida Stalker fallback for exception-driven wrappers.
   It follows worker threads created by bundled applications and reports trace
   counters for troubleshooting paths that were not executed.
-- Add an experimental, opt-in active probe for 32-bit exception-driven import
-  wrappers that are never reached during passive tracing.
-- Run active wrapper probes in a sacrificial target instance, translate call
-  sites by image RVA, and map resolved exports back by module and name so the
-  dump target remains intact even if speculative execution crashes.
-- Commit sacrificial probe results one wrapper at a time and reuse the prepared
-  target after a contained probe timeout, avoiding repeated OEP setup stalls.
-  Restart it only after a process or RPC failure.
-- Add a bounded, configurable timeout for each active wrapper probe.
+- Add opt-in, bounded natural-execution tracing in a sacrificial 32-bit target,
+  translating call sites by image RVA and exports back by module and name.
 - Add host-side hard deadlines to OEP setup and wrapper-tracing RPCs so a
   stalled Frida agent cannot block the controller indefinitely.
 - Add bounded sacrificial-process startup retries with visible progress and use
   the requested OEP timeout instead of an unrelated fixed ten-second limit.
-- Retry unresolved native wrappers with zero, readable-pointer, and mixed
-  argument profiles.
 - Add a bounded JSON post-build validation report for the OEP, executable entry
   section, import directories, resources, and bundle overlay.
 
 ### Fixed
-- Skip the final imported API during active wrapper probing so synthetic
-  arguments cannot terminate or corrupt the target process.
+- Replace synthetic per-wrapper thread execution with one bounded natural-run
+  trace in a clone blocked at its real OEP. This lets exception-driven wrappers
+  receive their genuine thread state and arguments.
+- Terminate sacrificial process trees before making any cleanup RPC, preventing
+  a timed-out Frida dispatcher from deadlocking cleanup and leaving multiple
+  target instances alive.
+- Handle an empty resolved-import set without requesting a zero-byte remote
+  allocation, and report a destroyed dump session without an uncaught traceback.
 - Simulate Windows heap APIs while resolving import wrappers instead of
   executing the real heap implementation with an incomplete emulated PEB.
 - Bound wrapper emulation and keep synthetic heap allocation local to Unicorn
   so a paused target cannot stall a nested Frida RPC indefinitely.
-- Preserve active-probe timeout errors and the last 64 active export hits in
-  the diagnostic report.
 - Simulate RTL string and boundary-descriptor cleanup calls used as wrapper
   noise, and report INT3-based wrappers without treating them as resolved.
 - Avoid printing raw ANSI color sequences in the Windows 7 console.
@@ -52,9 +47,7 @@
 - Keep post-`NtProtectVirtualMemory` OEP rearming isolated to sacrificial
   targets and remove execute permission only, preventing the primary target
   from faulting while Themida is still preparing its code section.
-- Retry intermittent primary OEP startup automatically and adopt a live
-  sacrificial process when its known OEP bytes prove it is already unpacked,
-  covering 32-bit Windows 7 targets where DEP does not enforce `rw-` pages.
+- Retry intermittent primary and sacrificial OEP startup automatically.
 - Preserve non-export call targets already located inside external DLLs instead
   of hash-matching them to unrelated exports, preventing observed false import
   rewrites such as an msvcrt target becoming `WLDAP32!ldap_set_dbg_routine`.

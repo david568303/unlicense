@@ -1,5 +1,6 @@
 import functools
 import logging
+import subprocess
 import threading
 import time
 from importlib import resources
@@ -247,16 +248,23 @@ class FridaProcessController(ProcessController):
             raise WriteProcessMemoryError from rpc_exception
 
     def terminate_process(self) -> None:
-        # Cleanup is best-effort: the script, process or session may already
-        # be gone (e.g. the target exited or crashed before the OEP was
-        # reached, which destroys the injected script). Each step is isolated
-        # so a failure in one doesn't skip the others or mask the original
-        # error that triggered this cleanup.
+        # Never make an RPC before terminating. A timed-out synchronous Frida
+        # RPC can keep the script dispatcher occupied indefinitely; attempting
+        # notify_dumping_finished() through that same dispatcher deadlocks the
+        # cleanup and leaves every sacrificial target alive. taskkill operates
+        # outside Frida and /T also removes children created by bundled apps.
         try:
-            self._frida_rpc.notify_dumping_finished()
-        except _TEARDOWN_ERRORS as frida_error:
-            LOG.debug("Failed to notify script (already destroyed?): %s",
-                      frida_error)
+            subprocess.run(["taskkill", "/PID",
+                            str(self.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=5,
+                           check=False,
+                           creationflags=getattr(subprocess,
+                                                 "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError) as process_error:
+            LOG.debug("Failed to terminate process tree PID=%d: %s", self.pid,
+                      process_error)
 
         try:
             frida.kill(self.pid)

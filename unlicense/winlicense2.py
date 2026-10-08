@@ -100,26 +100,36 @@ def fix_and_dump_pe(
                                  api_to_calls, wrapper_diagnostics,
                                  process_controller)
 
-    iat_addr, iat_size = _generate_new_iat_in_process(api_to_calls,
-                                                      text_section_range.base,
-                                                      process_controller)
-    LOG.info("Generated the fake IAT at %s, size=%s", hex(iat_addr),
-             hex(iat_size))
+    try:
+        iat_addr, iat_size = _generate_new_iat_in_process(
+            api_to_calls, text_section_range.base, process_controller)
+        if iat_size:
+            LOG.info("Generated the fake IAT at %s, size=%s", hex(iat_addr),
+                     hex(iat_size))
+            # Ensure the range is writable
+            process_controller.set_memory_protection(text_section_range.base,
+                                                     text_section_range.size,
+                                                     "rwx")
+            # Replace detected references to wrappers or imports
+            LOG.info("Patching call and jmp sites ...")
+            _fix_import_references_in_process(api_to_calls, iat_addr,
+                                              process_controller)
+            # Restore memory protection to RX
+            process_controller.set_memory_protection(text_section_range.base,
+                                                     text_section_range.size,
+                                                     "r-x")
+        else:
+            LOG.warning("No reliable imports were resolved; preserving all "
+                        "original call sites and rebuilding without a fake "
+                        "IAT")
 
-    # Ensure the range is writable
-    process_controller.set_memory_protection(text_section_range.base,
-                                             text_section_range.size, "rwx")
-    # Replace detected references to wrappers or imports
-    LOG.info("Patching call and jmp sites ...")
-    _fix_import_references_in_process(api_to_calls, iat_addr,
-                                      process_controller)
-    # Restore memory protection to RX
-    process_controller.set_memory_protection(text_section_range.base,
-                                             text_section_range.size, "r-x")
-
-    LOG.info("Dumping PE with OEP=%s ...", hex(oep))
-    dump_pe(process_controller, pe_file_path, image_base, oep, iat_addr,
-            iat_size, True)
+        LOG.info("Dumping PE with OEP=%s ...", hex(oep))
+        dump_pe(process_controller, pe_file_path, image_base, oep, iat_addr,
+                iat_size, True)
+    except Exception as error:
+        LOG.error(
+            "Dump target became unavailable before PE reconstruction: "
+            "%s", error)
 
 
 def _generate_export_hashes(
@@ -369,80 +379,49 @@ def _resolve_imports(
         else:
             probe_timeout = max(100, min(60000, active_probe_timeout))
             probe_controller: Optional[ProcessController] = None
-            probe_image_base: Optional[int] = None
             try:
-                for index, record in enumerate(unresolved_records, 1):
-                    if probe_controller is None or probe_image_base is None:
-                        probe_controller, probe_image_base = \
-                            probe_process_factory()
-                    if probe_controller is None or probe_image_base is None:
+                probe_controller, probe_image_base = probe_process_factory()
+                if probe_controller is None or probe_image_base is None:
+                    for record in unresolved_records:
                         record["probe_error"] = \
                             "sacrificial target unavailable"
-                        LOG.warning(
-                            "No sacrificial target is available for "
-                            "wrapper %d/%d", index, len(unresolved_records))
-                        break
-                    record["probe_pid"] = probe_controller.pid
-                    try:
-                        probe_requests, probe_to_main_calls = \
-                            _build_probe_trace_requests(
-                                [record], image_base, probe_image_base, md,
-                                probe_controller)
-                        if not probe_requests:
-                            continue
-                        profiles = ("zero", "readable", "mixed")
-                        probe_attempts: List[Dict[str, Any]] = []
-                        record["probe_attempts"] = probe_attempts
-                        for profile_index, profile in enumerate(profiles, 1):
-                            LOG.warning(
-                                "Actively probing wrapper %d/%d with profile "
-                                "%s (%d/%d) in reusable sacrificial target "
-                                "PID=%d (timeout=%d ms); the dump target "
-                                "remains untouched", index,
-                                len(unresolved_records), profile,
-                                profile_index, len(profiles),
-                                probe_controller.pid, probe_timeout)
-                            probe_results = \
-                                probe_controller.trace_wrapped_imports(
-                                    probe_requests, 0, True, probe_timeout,
-                                    profile)
-                            stats = probe_controller.last_wrapper_trace_stats
-                            record["probe_trace_stats"] = stats
-                            probe_attempts.append({
-                                "profile": profile,
-                                "stats": stats,
-                            })
-                            if stats is not None:
-                                probe_errors = stats.get(
-                                    "activeProbeErrors", [])
-                                if probe_errors:
-                                    record["probe_error"] = "; ".join(
-                                        str(error) for error in probe_errors)
-                            traced_imports = _translate_probe_results(
-                                probe_results, probe_to_main_calls,
-                                probe_controller, process_controller)
-                            apply_traced_imports([record], traced_imports,
-                                                 "sacrificial_native_trace")
-                            if record.get("resolved_address") is not None:
-                                record.pop("probe_error", None)
-                                break
-                            if (stats is not None
-                                    and stats.get("activeProbeReturns", 0) > 0
-                                    and not stats.get("activeProbeErrors")):
-                                record["probe_error"] = \
-                                    "probe returned without reaching an export"
-                                break
-                    except Exception as error:
+                    LOG.warning("No sacrificial target is available for "
+                                "natural wrapper tracing")
+                else:
+                    for record in unresolved_records:
+                        record["probe_pid"] = probe_controller.pid
+                    probe_requests, probe_to_main_calls = \
+                        _build_probe_trace_requests(
+                            unresolved_records, image_base, probe_image_base,
+                            md, probe_controller)
+                    LOG.warning(
+                        "Tracing %d unresolved wrapper(s) during %d ms of "
+                        "natural execution in one sacrificial target PID=%d; "
+                        "the dump target remains blocked", len(probe_requests),
+                        probe_timeout, probe_controller.pid)
+                    probe_results = probe_controller.trace_wrapped_imports(
+                        probe_requests, probe_timeout, False)
+                    stats = probe_controller.last_wrapper_trace_stats
+                    for record in unresolved_records:
+                        record["probe_trace_stats"] = stats
+                    traced_imports = _translate_probe_results(
+                        probe_results, probe_to_main_calls, probe_controller,
+                        process_controller)
+                    apply_traced_imports(unresolved_records, traced_imports,
+                                         "sacrificial_natural_trace")
+                    for record in unresolved_records:
+                        if record.get("resolved_address") is None:
+                            record["probe_error"] = (
+                                "wrapper was not resolved during natural "
+                                f"execution ({probe_timeout} ms)")
+                        else:
+                            record.pop("probe_error", None)
+            except Exception as error:
+                for record in unresolved_records:
+                    if record.get("resolved_address") is None:
                         record["probe_error"] = str(error)
-                        LOG.warning("Sacrificial wrapper %d/%d failed: %s",
-                                    index, len(unresolved_records), error)
-                        # A failed or timed-out RPC leaves the session state
-                        # unknown. Discard it, then retry later wrappers in a
-                        # fresh target. A normal in-agent probe timeout is
-                        # returned in stats and safely reuses this process.
-                        probe_controller.terminate_process()
-                        probe_controller = None
-                        probe_image_base = None
+                LOG.warning("Sacrificial natural wrapper tracing failed: %s",
+                            error)
             finally:
                 if probe_controller is not None:
                     probe_controller.terminate_process()
@@ -636,6 +615,8 @@ def _generate_new_iat_in_process(
     ptr_size = process_controller.pointer_size
     ptr_format = pointer_size_to_fmt(ptr_size)
     iat_size = len(imports_dict) * ptr_size
+    if iat_size == 0:
+        return 0, 0
     # Allocate a new buffer in the target process
     iat_addr = process_controller.allocate_process_memory(
         iat_size, near_to_ptr)
