@@ -15,7 +15,8 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore
 from unlicense.application import (_create_primary_process,
                                    _create_probe_process, _normalize_cli_bool,
                                    _wait_for_event_with_progress)
-from unlicense.dump_utils import _resize_pe
+from unlicense.dump_utils import (_materialize_iat_input, _resize_pe,
+                                  _search_fallback_iat)
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
 from unlicense.frida_exec import (FridaProcessController, _call_with_timeout,
                                   _wrapper_trace_collection_timeout)
@@ -306,6 +307,45 @@ class HeapWrapperEmulationTests(unittest.TestCase):
 
             self.assertEqual(b"R" * 80 + b"BUNDLED-DLL-DATA",
                              output.read_bytes())
+
+    def test_scylla_iat_search_retries_in_advanced_mode(self) -> None:
+        controller = FakeProcessController({}, {})
+        with patch("unlicense.dump_utils.pyscylla.search_iat",
+                   side_effect=[(0, 0), (0x6400000, 0x80)]) as search_iat:
+            result = _search_fallback_iat(controller, 0x400000, 0xd54c3f)
+
+        self.assertEqual((0x6400000, 0x80), result)
+        self.assertEqual([
+            ((controller.pid, 0x400000, 0xd54c3f, False), {}),
+            ((controller.pid, 0x400000, 0xd54c3f, True), {}),
+        ], search_iat.call_args_list)
+
+    def test_zero_iat_preserves_unmodified_memory_dump(self) -> None:
+        controller = FakeProcessController({}, {})
+        with tempfile.TemporaryDirectory() as directory:
+            dumped = Path(directory) / "memory.dump"
+            output = Path(directory) / "iat.input"
+            dumped.write_bytes(b"PE-DUMP-WITH-ORIGINAL-DIRECTORIES")
+            with patch("unlicense.dump_utils.pyscylla.fix_iat") as fix_iat:
+                was_fixed = _materialize_iat_input(
+                    controller, 0x400000, 0, 0, True, str(dumped),
+                    str(output))
+
+            self.assertFalse(was_fixed)
+            self.assertEqual(dumped.read_bytes(), output.read_bytes())
+            fix_iat.assert_not_called()
+
+    def test_nonempty_iat_uses_scylla_reconstruction(self) -> None:
+        controller = FakeProcessController({}, {})
+        with patch("unlicense.dump_utils.pyscylla.fix_iat") as fix_iat:
+            was_fixed = _materialize_iat_input(
+                controller, 0x400000, 0x6400000, 0x80, True, "dumped.exe",
+                "fixed.exe")
+
+        self.assertTrue(was_fixed)
+        fix_iat.assert_called_once_with(controller.pid, 0x400000, 0x6400000,
+                                        0x80, True, "dumped.exe",
+                                        "fixed.exe")
 
     def test_native_trace_result_resolves_exception_wrapper(self) -> None:
         call_site = 0x401000

@@ -70,6 +70,12 @@ the host revalidates each call site before patching it. A call site observed
 with different export destinations or without enough patch space is left
 untouched and reported in the diagnostic JSON.
 
+If neither static nor native wrapper recovery produces an import, Unlicense now
+asks Scylla to search the live process for an existing IAT. When that also
+fails, it preserves the dumped image's existing import directory and bypasses
+Scylla's empty-table reconstruction. The validation JSON records the selected
+`iat_reconstruction_strategy` and runtime IAT range.
+
 `--native_trace_timeout` and `--active_wrapper_probe` may be combined. The
 explicit native-trace window always runs first on the dump target; a
 sacrificial instance is started afterwards only for wrappers that remain

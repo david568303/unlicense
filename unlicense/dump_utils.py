@@ -6,7 +6,7 @@ import platform
 import shutil
 import struct
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import lief
 import pyscylla  # type: ignore
@@ -16,6 +16,35 @@ from unlicense.lief_utils import lief_pe_data_directories, lief_pe_sections
 from .process_control import MemoryRange, ProcessController
 
 LOG = logging.getLogger(__name__)
+
+
+def _search_fallback_iat(process_controller: ProcessController,
+                         image_base: int, oep: int) -> Tuple[int, int]:
+    """Ask Scylla for an existing runtime IAT when custom recovery found none."""
+    for advanced in (False, True):
+        try:
+            iat_addr, iat_size = pyscylla.search_iat(
+                process_controller.pid, image_base, oep, advanced)
+        except pyscylla.ScyllaException as error:
+            LOG.debug("Scylla %s IAT search failed: %s",
+                      "advanced" if advanced else "basic", error)
+            continue
+        if iat_addr > 0 and iat_size >= process_controller.pointer_size:
+            return int(iat_addr), int(iat_size)
+    return 0, 0
+
+
+def _materialize_iat_input(process_controller: ProcessController,
+                           image_base: int, iat_addr: int, iat_size: int,
+                           add_new_iat: bool, dumped_path: str,
+                           output_path: str) -> bool:
+    """Fix a real IAT, or preserve the dump byte-for-byte when none exists."""
+    if iat_size == 0:
+        shutil.copyfile(dumped_path, output_path)
+        return False
+    pyscylla.fix_iat(process_controller.pid, image_base, iat_addr, iat_size,
+                     add_new_iat, dumped_path, output_path)
+    return True
 
 
 def get_section_ranges(pe_file_path: str) -> List[MemoryRange]:
@@ -79,6 +108,24 @@ def dump_pe(
     process_controller.clear_cached_data()
     gc.collect()
 
+    effective_iat_addr = iat_addr
+    effective_iat_size = iat_size
+    effective_add_new_iat = add_new_iat
+    iat_strategy = "recovered"
+    if effective_iat_size == 0:
+        effective_iat_addr, effective_iat_size = _search_fallback_iat(
+            process_controller, image_base, oep)
+        if effective_iat_size > 0:
+            effective_add_new_iat = True
+            iat_strategy = "scylla_search"
+            LOG.info("Scylla fallback IAT found at %s, size=%s",
+                     hex(effective_iat_addr), hex(effective_iat_size))
+        else:
+            iat_strategy = "preserved_dump"
+            LOG.warning(
+                "No runtime IAT was found; preserving the dumped image's "
+                "existing import directory instead of rebuilding an empty IAT")
+
     with TemporaryDirectory() as tmp_dir:
         TMP_FILE_PATH1 = os.path.join(tmp_dir, "unlicense.dump")
         TMP_FILE_PATH2 = os.path.join(tmp_dir, "unlicense.iat")
@@ -91,12 +138,20 @@ def dump_pe(
 
         LOG.info("Fixing dump ...")
         try:
-            pyscylla.fix_iat(process_controller.pid, image_base, iat_addr,
-                             iat_size, add_new_iat, TMP_FILE_PATH1,
-                             TMP_FILE_PATH2)
+            _materialize_iat_input(process_controller, image_base,
+                                   effective_iat_addr, effective_iat_size,
+                                   effective_add_new_iat, TMP_FILE_PATH1,
+                                   TMP_FILE_PATH2)
         except pyscylla.ScyllaException as scylla_exception:
-            LOG.error("Failed to fix IAT: %s", str(scylla_exception))
-            return False
+            # A false-positive Scylla search should not destroy an otherwise
+            # useful raw dump. Keep the original directories as a bounded
+            # fallback and make the strategy explicit in diagnostics.
+            LOG.warning("Failed to fix the discovered IAT: %s; preserving "
+                        "the unmodified memory dump", str(scylla_exception))
+            shutil.copyfile(TMP_FILE_PATH1, TMP_FILE_PATH2)
+            effective_iat_addr = 0
+            effective_iat_size = 0
+            iat_strategy = "preserved_after_iat_failure"
 
         try:
             pyscylla.rebuild_pe(TMP_FILE_PATH2, False, True, False)
@@ -110,7 +165,10 @@ def dump_pe(
 
         validation = _validate_dump(
             output_file_name, pe_file_path, oep - image_base,
-            iat_size // max(1, process_controller.pointer_size))
+            effective_iat_size // max(1, process_controller.pointer_size))
+        validation["iat_reconstruction_strategy"] = iat_strategy
+        validation["runtime_iat_address"] = hex(effective_iat_addr)
+        validation["runtime_iat_size"] = effective_iat_size
         validation_path = f"{output_file_name}.validation.json"
         try:
             with open(validation_path, "w", encoding="utf-8") as report_file:

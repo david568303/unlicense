@@ -22,6 +22,9 @@
   `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
+- Use Scylla's native IAT search when Themida 2.x recovery produces no imports.
+  If no runtime IAT exists, skip `fix_iat(0, 0)` and preserve the memory dump's
+  existing import directory instead of rebuilding it from an empty table.
 - Revalidate every dynamically observed call site on the host and only patch
   six-byte Themida patterns with one stable export destination. Conflicting or
   ordinary five-byte calls are preserved rather than overwritten.
