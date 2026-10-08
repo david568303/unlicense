@@ -16,6 +16,7 @@ from .process_control import (ProcessController, Architecture, MemoryRange,
                               ReadProcessMemoryError)
 
 LOG = logging.getLogger(__name__)
+NON_IMPORT_RESOLUTION_METHODS = {"internal_call", "external_code_target"}
 
 
 def fix_and_dump_pe(
@@ -78,10 +79,17 @@ def fix_and_dump_pe(
         active_probe_timeout, image_base, probe_process_factory)
     LOG.info("Imports resolved: %d", len(api_to_calls))
 
+    preserved_external_count = sum(
+        1 for wrapper in wrapper_diagnostics
+        if wrapper.get("resolution_method") == "external_code_target")
+    if preserved_external_count:
+        LOG.info("Preserved external code targets: %d",
+                 preserved_external_count)
+
     unresolved_count = sum(
         1 for wrapper in wrapper_diagnostics
-        if wrapper.get("resolved_address") is None
-        and wrapper.get("resolution_method") != "internal_call")
+        if wrapper.get("resolved_address") is None and wrapper.get(
+            "resolution_method") not in NON_IMPORT_RESOLUTION_METHODS)
     if unresolved_count > 0:
         LOG.warning("Unresolved import wrappers: %d/%d. The dump may not run.",
                     unresolved_count, len(wrapper_diagnostics))
@@ -222,6 +230,23 @@ def _resolve_imports(
             record["wrapper_module_error"] = str(error)
         diagnostics.append(record)
 
+        wrapper_module = record.get("wrapper_module")
+        wrapper_module_name = (wrapper_module.get("name") if isinstance(
+            wrapper_module, dict) else None)
+        if (isinstance(wrapper_module_name, str)
+                and wrapper_module_name.lower() !=
+                process_controller.main_module_name.lower()):
+            # Exact exports were already classified by find_wrapped_imports.
+            # A non-export address inside a system/embedded DLL is executable
+            # external code, not a Themida wrapper owned by the main image.
+            # Hashing such code can collide with an unrelated short export
+            # (observed as msvcrt code being rewritten to WLDAP32), corrupting
+            # an otherwise valid call site.
+            record["resolution_method"] = "external_code_target"
+            LOG.debug("Preserving external code target: %s -> %s!%s",
+                      hex(call_addr), wrapper_module_name, hex(wrapper_addr))
+            continue
+
         resolved_addr = resolved_wrappers.get(wrapper_addr)
         if resolved_addr is not None:
             LOG.debug("Already resolved wrapper: %s -> %s", hex(wrapper_addr),
@@ -275,9 +300,6 @@ def _resolve_imports(
                 (call_addr, call_size, instr_was_jmp))
             record_resolution(record, "emulation", resolved_addr)
         else:
-            wrapper_module = record.get("wrapper_module")
-            wrapper_module_name = (wrapper_module.get("name") if isinstance(
-                wrapper_module, dict) else None)
             if (emulation_diagnostic.get("returned_without_export")
                     and isinstance(wrapper_module_name, str)
                     and wrapper_module_name.lower()
@@ -305,9 +327,9 @@ def _resolve_imports(
             record_resolution(record, method, resolved_addr)
 
     unresolved_records = sorted(
-        (record
-         for record in diagnostics if record.get("resolved_address") is None
-         and record.get("resolution_method") != "internal_call"),
+        (record for record in diagnostics
+         if record.get("resolved_address") is None and record.get(
+             "resolution_method") not in NON_IMPORT_RESOLUTION_METHODS),
         key=lambda record: int(record["call_address"], 16))
     if (native_trace_timeout > 0 and active_wrapper_probe
             and unresolved_records):
@@ -331,9 +353,9 @@ def _resolve_imports(
                              "native_trace")
 
     unresolved_records = sorted(
-        (record
-         for record in diagnostics if record.get("resolved_address") is None
-         and record.get("resolution_method") != "internal_call"),
+        (record for record in diagnostics
+         if record.get("resolved_address") is None and record.get(
+             "resolution_method") not in NON_IMPORT_RESOLUTION_METHODS),
         key=lambda record: int(record["call_address"], 16))
     if (active_wrapper_probe and unresolved_records
             and arch != Architecture.X86_32):

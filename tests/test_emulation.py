@@ -12,7 +12,8 @@ from unicorn import (  # type: ignore
     Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_ERR_MAP)
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore
 
-from unlicense.application import (_create_probe_process,
+from unlicense.application import (_create_primary_process,
+                                   _create_probe_process,
                                    _wait_for_event_with_progress)
 from unlicense.dump_utils import _resize_pe
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
@@ -43,9 +44,18 @@ class FakeProcessController(ProcessController):
         self.trace_call_count = 0
         self.terminate_count = 0
         self.module_addresses: Dict[int, Dict[str, Any]] = {}
+        self.module_names: Dict[str, Dict[str, Any]] = {}
+        self.adopted_oep: Optional[int] = None
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
         return self.module_addresses.get(address)
+
+    def find_module_by_name(self,
+                            module_name: str) -> Optional[Dict[str, Any]]:
+        return self.module_names.get(module_name.lower())
+
+    def adopt_ready_target(self, oep: int) -> None:
+        self.adopted_oep = oep
 
     def find_range_by_address(
             self,
@@ -183,6 +193,69 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual(1, first.terminate_count)
         self.assertEqual(0, second.terminate_count)
         self.assertEqual([True, True], rearm_modes)
+
+    def test_primary_startup_retries_after_first_oep_miss(self) -> None:
+        first = FakeProcessController({}, {})
+        second = FakeProcessController({}, {})
+        launches = 0
+
+        def spawn(
+                _path: Path,
+                _ranges: List[MemoryRange],
+                callback: Any,
+                _timeout_ms: int = 15000,
+                post_protect_oep_rearm: bool = False) -> FakeProcessController:
+            nonlocal launches
+            self.assertFalse(post_protect_oep_rearm)
+            launches += 1
+            if launches == 1:
+                return first
+            callback(0x400000, 0xd54c3f, False)
+            return second
+
+        with patch("unlicense.application.frida_exec.spawn_and_instrument",
+                   side_effect=spawn):
+            controller, image_base, oep, dotnet = _create_primary_process(
+                Path("fixture.exe"), [MemoryRange(0x1000, 0x1000, "r-x")], 0.0,
+                1)
+
+        self.assertIs(second, controller)
+        self.assertEqual(0x400000, image_base)
+        self.assertEqual(0xd54c3f, oep)
+        self.assertFalse(dotnet)
+        self.assertEqual(1, first.terminate_count)
+        self.assertEqual(0, second.terminate_count)
+
+    def test_sacrificial_target_can_adopt_verified_unpacked_oep(self) -> None:
+        image_base = 0x500000
+        oep_rva = 0x1000
+        signature = bytes.fromhex("558bec83ec105356")
+        page = signature + bytes(0x1000 - len(signature))
+        controller = FakeProcessController({image_base + oep_rva: page}, {})
+        controller.module_names["fixture.exe"] = {
+            "name": "fixture.exe",
+            "base": hex(image_base),
+        }
+
+        def spawn(
+                _path: Path,
+                _ranges: List[MemoryRange],
+                _callback: Any,
+                _timeout_ms: int,
+                post_protect_oep_rearm: bool = False) -> FakeProcessController:
+            self.assertTrue(post_protect_oep_rearm)
+            return controller
+
+        with patch("unlicense.application.frida_exec.spawn_and_instrument",
+                   side_effect=spawn):
+            result, detected_base = _create_probe_process(
+                Path("fixture.exe"), [MemoryRange(0x1000, 0x1000, "r-x")],
+                0.01, 1000, 0, oep_rva, signature)
+
+        self.assertIs(controller, result)
+        self.assertEqual(image_base, detected_base)
+        self.assertEqual(image_base + oep_rva, controller.adopted_oep)
+        self.assertEqual(0, controller.terminate_count)
 
     def test_rebuilt_pe_preserves_original_bundle_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -520,6 +593,40 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual({}, imports)
         self.assertEqual("internal_call", diagnostics[0]["resolution_method"])
         self.assertTrue(diagnostics[0]["emulation"]["returned_without_export"])
+
+    def test_external_code_target_is_not_rewritten_on_hash_collision(
+            self) -> None:
+        call_site = 0x401000
+        external_target = 0x76001234
+        unrelated_api = 0x77005678
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, external_target)
+        controller = FakeProcessController(
+            {call_site: bytes(call_page)},
+            {unrelated_api: {
+                "name": "UnrelatedApi",
+                "module": "other.dll",
+            }})
+        controller.module_addresses[external_target] = {
+            "name": "msvcrt.dll",
+            "base": "0x76000000",
+            "size": 0x100000,
+        }
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        with patch("unlicense.winlicense2.compute_function_hash") as hasher:
+            hasher.return_value = 0x12345678
+            diagnostics = _resolve_imports(
+                imports, {(call_site, 5, False, external_target, None)},
+                {0x12345678: unrelated_api}, controller.exports, disassembler,
+                controller)
+
+        self.assertEqual({}, imports)
+        self.assertEqual("external_code_target",
+                         diagnostics[0]["resolution_method"])
+        hasher.assert_not_called()
 
     def test_synthetic_heap_search_is_bounded(self) -> None:
         controller = FakeProcessController({}, {})

@@ -824,8 +824,24 @@ rpc.exports = {
     getArchitecture: function () { return Process.arch; },
     getPointerSize: function () { return Process.pointerSize; },
     getPageSize: function () { return Process.pageSize; },
+    findModuleByName: function (moduleName) {
+        return Process.findModuleByName(moduleName);
+    },
     findModuleByAddress: function (address) {
         return Process.findModuleByAddress(ptr(address));
+    },
+    adoptReadyTarget: function (oepAddress) {
+        if (oepThreadId === null) {
+            const threads = Process.enumerateThreads();
+            if (threads.length === 0) {
+                throw new Error('Ready target has no threads');
+            }
+            oepThreadId = threads[0].id;
+        }
+        oepReached = true;
+        removeOepTracingHooks();
+        setOepRangesProtection('rwx');
+        log(`Adopted verified ready target at known OEP ${oepAddress}`);
     },
     findRangeByAddress: function (address) {
         return Process.findRangeByAddress(ptr(address));

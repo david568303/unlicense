@@ -78,6 +78,15 @@ class FridaProcessController(ProcessController):
                                  hex(address))
         return value
 
+    def find_module_by_name(self,
+                            module_name: str) -> Optional[Dict[str, Any]]:
+        value: Optional[Dict[str, Any]] = self._frida_rpc.find_module_by_name(
+            module_name)
+        return value
+
+    def adopt_ready_target(self, oep: int) -> None:
+        self._frida_rpc.adopt_ready_target(hex(oep))
+
     def find_range_by_address(
             self,
             address: int,

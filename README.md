@@ -100,6 +100,14 @@ every five seconds, and retries twice by default; use
 records each argument-profile attempt, its errors, and the last 64 exports
 reached by the active probe.
 
+On 32-bit Windows 7 processes without effective DEP, removing execute
+permission may not generate an OEP event. In that case Unlicense compares the
+known OEP bytes from the blocked dump target with the same module RVA in the
+sacrificial process. A matching live instance is adopted as already unpacked;
+translated CALL/JMP sites are still decoded and checked before any wrapper is
+probed. The primary target also retries once by default when early WinLicense
+startup is intermittent. Set `--oep_startup_retries=0` to disable that retry.
+
 The rebuilt output preserves the original executable overlay, which is
 important for single-file bundles that append DLLs or metadata after the PE
 sections. Unlicense also writes `unpacked_<target>.validation.json` beside the
@@ -184,6 +192,9 @@ FLAGS
     --timeout=TIMEOUT
         Type: int
         Default: 10
+    --oep_startup_retries=OEP_STARTUP_RETRIES
+        Type: int
+        Default: 1
     --diagnostic_output=DIAGNOSTIC_OUTPUT
         Type: Optional[Optional]
         Default: None

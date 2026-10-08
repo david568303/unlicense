@@ -44,6 +44,16 @@ class ProcessController(abc.ABC):
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
 
+    def find_module_by_name(self,
+                            module_name: str) -> Optional[Dict[str, Any]]:
+        """Return module metadata when the backend supports it."""
+        del module_name
+        return None
+
+    def adopt_ready_target(self, oep: int) -> None:
+        """Mark a verified, already-running target ready for active probes."""
+        del oep
+
     @abc.abstractmethod
     def find_range_by_address(
             self,

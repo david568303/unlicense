@@ -52,6 +52,12 @@
 - Keep post-`NtProtectVirtualMemory` OEP rearming isolated to sacrificial
   targets and remove execute permission only, preventing the primary target
   from faulting while Themida is still preparing its code section.
+- Retry intermittent primary OEP startup automatically and adopt a live
+  sacrificial process when its known OEP bytes prove it is already unpacked,
+  covering 32-bit Windows 7 targets where DEP does not enforce `rw-` pages.
+- Preserve non-export call targets already located inside external DLLs instead
+  of hash-matching them to unrelated exports, preventing observed false import
+  rewrites such as an msvcrt target becoming `WLDAP32!ldap_set_dbg_routine`.
 
 ## [0.4.0] - 2023-08-14
 ### Added

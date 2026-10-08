@@ -31,6 +31,7 @@ def run_unlicense(
     force_oep: Optional[int] = None,
     target_version: Optional[int] = None,
     timeout: int = 10,
+    oep_startup_retries: int = 1,
     diagnostic_output: Optional[str] = None,
     native_trace_timeout: int = 0,
     active_wrapper_probe: bool = False,
@@ -73,29 +74,13 @@ def run_unlicense(
         LOG.error("Failed to automatically detect .text section")
         sys.exit(4)
 
-    dumped_image_base = 0
-    dumped_oep = 0
-    is_dotnet = False
-    oep_reached = threading.Event()
-
-    def notify_oep_reached(image_base: int, oep: int, dotnet: bool) -> None:
-        nonlocal dumped_image_base
-        nonlocal dumped_oep
-        nonlocal is_dotnet
-        dumped_image_base = image_base
-        dumped_oep = oep
-        is_dotnet = dotnet
-        oep_reached.set()
-
-    # Spawn the packed executable and instrument it to find its OEP
-    process_controller = frida_exec.spawn_and_instrument(
-        pe_path, text_section_ranges, notify_oep_reached)
+    process_controller, dumped_image_base, dumped_oep, is_dotnet = \
+        _create_primary_process(pe_path, text_section_ranges, float(timeout),
+                                oep_startup_retries)
+    if process_controller is None:
+        LOG.error("Original entry point wasn't reached after all attempts")
+        sys.exit(4)
     try:
-        # Block until OEP is reached
-        if not oep_reached.wait(float(timeout)):
-            LOG.error("Original entry point wasn't reached before timeout")
-            sys.exit(4)
-
         LOG.info("OEP reached: OEP=%s BASE=%s DOTNET=%r", hex(dumped_oep),
                  hex(dumped_image_base), is_dotnet)
         if pause_on_oep:
@@ -124,13 +109,23 @@ def run_unlicense(
         elif target_version == 2:
             assert text_section_ranges is not None
             probe_ranges = text_section_ranges
+            known_oep_rva = dumped_oep - dumped_image_base
+            known_oep_bytes: Optional[bytes]
+            try:
+                known_oep_bytes = process_controller.read_process_memory(
+                    dumped_oep, 16)
+            except Exception as error:
+                LOG.warning("Failed to capture OEP verification bytes: %s",
+                            error)
+                known_oep_bytes = None
 
             def create_probe_process(
             ) -> Tuple[Optional[ProcessController], Optional[int]]:
                 return _create_probe_process(
                     pe_path, probe_ranges, max(10.0, float(timeout)),
                     max(15000, min(60000, active_probe_timeout * 2)),
-                    active_probe_startup_retries)
+                    active_probe_startup_retries, known_oep_rva,
+                    known_oep_bytes)
 
             winlicense2.fix_and_dump_pe(
                 process_controller, pe_to_dump, dumped_image_base, dumped_oep,
@@ -170,12 +165,60 @@ def _wait_for_event_with_progress(event: threading.Event,
                  timeout_seconds)
 
 
+def _create_primary_process(
+    pe_path: Path,
+    text_section_ranges: List[MemoryRange],
+    startup_wait_seconds: float,
+    startup_retries: int,
+) -> Tuple[Optional[ProcessController], int, int, bool]:
+    attempts = max(1, min(5, startup_retries + 1))
+    for attempt in range(1, attempts + 1):
+        oep_reached = threading.Event()
+        controller: Optional[ProcessController] = None
+        state: Dict[str, Any] = {
+            "image_base": 0,
+            "oep": 0,
+            "dotnet": False,
+        }
+
+        def notify_oep(image_base: int,
+                       oep: int,
+                       dotnet: bool,
+                       event: threading.Event = oep_reached,
+                       attempt_state: Dict[str, Any] = state) -> None:
+            attempt_state["image_base"] = image_base
+            attempt_state["oep"] = oep
+            attempt_state["dotnet"] = dotnet
+            event.set()
+
+        LOG.info("Starting primary target attempt %d/%d", attempt, attempts)
+        try:
+            controller = frida_exec.spawn_and_instrument(
+                pe_path, text_section_ranges, notify_oep)
+            if _wait_for_event_with_progress(
+                    oep_reached, max(0.1, startup_wait_seconds),
+                    f"primary target attempt {attempt}/{attempts}"):
+                return (controller, int(state["image_base"]),
+                        int(state["oep"]), bool(state["dotnet"]))
+            LOG.warning(
+                "Primary target attempt %d/%d did not reach its OEP before "
+                "%.0f seconds", attempt, attempts, startup_wait_seconds)
+        except Exception as error:
+            LOG.warning("Primary target attempt %d/%d failed: %s", attempt,
+                        attempts, error)
+        if controller is not None:
+            controller.terminate_process()
+    return None, 0, 0, False
+
+
 def _create_probe_process(
     pe_path: Path,
     text_section_ranges: List[MemoryRange],
     startup_wait_seconds: float,
     setup_timeout_ms: int,
     startup_retries: int,
+    known_oep_rva: Optional[int] = None,
+    known_oep_bytes: Optional[bytes] = None,
 ) -> Tuple[Optional[ProcessController], Optional[int]]:
     attempts = max(1, min(5, startup_retries + 1))
     for attempt in range(1, attempts + 1):
@@ -205,9 +248,17 @@ def _create_probe_process(
                 notify_oep,
                 setup_timeout_ms,
                 post_protect_oep_rearm=True)
-            reached = _wait_for_event_with_progress(
-                oep_reached, startup_wait_seconds,
-                f"sacrificial target attempt {attempt}/{attempts}")
+            reached, verified_base = _wait_for_probe_ready(
+                controller, pe_path.name, oep_reached, startup_wait_seconds,
+                attempt, attempts, known_oep_rva, known_oep_bytes)
+            if verified_base is not None:
+                assert known_oep_rva is not None
+                controller.adopt_ready_target(verified_base + known_oep_rva)
+                LOG.warning(
+                    "Sacrificial target missed its OEP notification but its "
+                    "known OEP bytes match at BASE=%s; adopting the already "
+                    "unpacked live process", hex(verified_base))
+                return controller, verified_base
             if not reached:
                 LOG.warning(
                     "Sacrificial target attempt %d/%d did not reach its OEP "
@@ -229,3 +280,47 @@ def _create_probe_process(
         if controller is not None:
             controller.terminate_process()
     return None, None
+
+
+def _wait_for_probe_ready(
+    controller: ProcessController,
+    module_name: str,
+    oep_reached: threading.Event,
+    timeout_seconds: float,
+    attempt: int,
+    attempts: int,
+    known_oep_rva: Optional[int],
+    known_oep_bytes: Optional[bytes],
+    progress_interval: float = 5.0,
+) -> Tuple[bool, Optional[int]]:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    started = time.monotonic()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return oep_reached.is_set(), None
+        if oep_reached.wait(min(max(0.1, progress_interval), remaining)):
+            return True, None
+
+        if known_oep_rva is not None and known_oep_bytes:
+            try:
+                module = controller.find_module_by_name(module_name)
+                if module is not None:
+                    raw_base = module.get("base")
+                    if isinstance(raw_base, str):
+                        image_base = int(raw_base, 16)
+                    elif isinstance(raw_base, int):
+                        image_base = raw_base
+                    else:
+                        raise ValueError("sacrificial module base unavailable")
+                    candidate = controller.read_process_memory(
+                        image_base + known_oep_rva, len(known_oep_bytes))
+                    if candidate == known_oep_bytes:
+                        return False, image_base
+            except Exception as error:
+                LOG.debug("Sacrificial readiness check failed: %s", error)
+
+        elapsed = time.monotonic() - started
+        LOG.info(
+            "Waiting for sacrificial target attempt %d/%d: %.0f/%.0f "
+            "seconds", attempt, attempts, elapsed, timeout_seconds)
