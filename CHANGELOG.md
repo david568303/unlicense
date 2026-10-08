@@ -22,6 +22,11 @@
   `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
+- Recognize Themida 2.x's complete LoadLibraryA/W and LoadLibraryExA/W hook
+  family and rebuild those call sites as real imports. These hooks were
+  previously classified as internal application calls, leaving standalone
+  dumps dependent on protector-owned heap records that are invalid after a
+  restart.
 - Detect the exact Themida 2.x private-state integrity guard that dereferences a
   process-only allocation after restart and replace its entry with the guard's
   normal success result. This avoids an access violation in the protector

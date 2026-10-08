@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import struct
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Any, Optional
@@ -18,6 +19,103 @@ from .process_control import (ProcessController, Architecture, MemoryRange,
 LOG = logging.getLogger(__name__)
 NON_IMPORT_RESOLUTION_METHODS = {"internal_call", "external_code_target"}
 ExportHashCandidates = Dict[int, List[int]]
+
+# Themida 2.x installs a four-function family around LoadLibraryA/W and
+# LoadLibraryExA/W.  These are not ordinary application helpers: they retain
+# pointers to protector-owned heap records and therefore cannot survive in a
+# standalone dump whose entry point starts after the protector initialized
+# them.  Match the complete family, rather than a short individual thunk, so
+# internal application calls are not guessed from a generic prologue.
+_THEMIDA_LOAD_LIBRARY_SIMPLE = (
+    re.escape(bytes.fromhex("5589e583ec0452e8000000005a81ea")) +
+    b".{4}" + re.escape(bytes.fromhex("ffb2")) + b".{4}" +
+    re.escape(bytes.fromhex("e8")) + b".{4}" +
+    re.escape(bytes.fromhex("52ff7508e8")) + b".{4}" +
+    re.escape(bytes.fromhex("5a6a0050e8")) + b".{4}" +
+    re.escape(bytes.fromhex("5ac9c20400")))
+_THEMIDA_LOAD_LIBRARY_EXTENDED = (
+    re.escape(bytes.fromhex("5589e583ec0452e8000000005a81ea")) +
+    b".{4}" + re.escape(bytes.fromhex("ffb2")) + b".{4}" +
+    re.escape(bytes.fromhex("e8")) + b".{4}" +
+    re.escape(bytes.fromhex("52ff7510ff750cff7508e8")) + b".{4}" +
+    re.escape(bytes.fromhex(
+        "5a538b5d1083e36285db0f8509000000ff751050e8")) + b".{4}" +
+    re.escape(bytes.fromhex("5b5ac9c20c00")))
+_THEMIDA_LOAD_LIBRARY_FAMILY = re.compile(
+    _THEMIDA_LOAD_LIBRARY_SIMPLE * 2 +
+    _THEMIDA_LOAD_LIBRARY_EXTENDED * 2, re.DOTALL)
+_THEMIDA_LOAD_LIBRARY_MEMBERS = (
+    (0x00, "LoadLibraryA"),
+    (0x35, "LoadLibraryW"),
+    (0x6a, "LoadLibraryExA"),
+    (0xb6, "LoadLibraryExW"),
+)
+_THEMIDA_LOAD_LIBRARY_FAMILY_SIZE = 0x102
+
+
+def _identify_themida_load_library_wrapper(
+        wrapper_address: int,
+        get_data: Callable[[int, int], bytes]) -> Optional[str]:
+    """Identify an x86 Themida LoadLibrary-family wrapper by full layout."""
+    for member_offset, export_name in _THEMIDA_LOAD_LIBRARY_MEMBERS:
+        family_address = wrapper_address - member_offset
+        try:
+            family_data = bytearray()
+            while len(family_data) < _THEMIDA_LOAD_LIBRARY_FAMILY_SIZE:
+                address = family_address + len(family_data)
+                chunk = get_data(
+                    address,
+                    _THEMIDA_LOAD_LIBRARY_FAMILY_SIZE - len(family_data))
+                if not chunk:
+                    break
+                family_data.extend(chunk)
+        except ReadProcessMemoryError:
+            continue
+        if len(family_data) != _THEMIDA_LOAD_LIBRARY_FAMILY_SIZE:
+            continue
+        if _THEMIDA_LOAD_LIBRARY_FAMILY.fullmatch(bytes(family_data)):
+            return export_name
+    return None
+
+
+def _find_unhooked_export(
+        export_name: str,
+        wrapper_address: int,
+        exports_dict: Dict[int, Dict[str, Any]],
+        process_controller: ProcessController) -> Optional[int]:
+    """Find an export implementation that does not point back into Themida."""
+    preferred_modules = {"kernel32.dll": 0, "kernelbase.dll": 1}
+    candidates = sorted(
+        ((preferred_modules.get(str(export.get("module", "")).lower(), 2),
+          address) for address, export in exports_dict.items()
+         if export.get("name") == export_name),
+        key=lambda candidate: (candidate[0], candidate[1]))
+    for _, address in candidates:
+        if address == wrapper_address:
+            continue
+        module = process_controller.find_module_by_address(address)
+        module_name = module.get("name") if isinstance(module, dict) else None
+        if (isinstance(module_name, str)
+                and module_name.lower()
+                == process_controller.main_module_name.lower()):
+            continue
+        return address
+
+    # Some Frida versions omit forwarded exports from enumerateExports().
+    # Accept the name lookup only when its resolved address is demonstrably
+    # outside the protected image; Themida can hook this lookup and return its
+    # own wrapper address.
+    resolved_address = process_controller.find_export_by_name(
+        "kernel32.dll", export_name)
+    if resolved_address is None or resolved_address == wrapper_address:
+        return None
+    module = process_controller.find_module_by_address(resolved_address)
+    module_name = module.get("name") if isinstance(module, dict) else None
+    if (isinstance(module_name, str)
+            and module_name.lower()
+            == process_controller.main_module_name.lower()):
+        return None
+    return resolved_address
 
 
 def fix_and_dump_pe(
@@ -331,6 +429,33 @@ def _resolve_imports(
             LOG.debug("Skipping unresolved wrapper")
             record["resolution_method"] = "previous_failure"
             continue
+
+        # The LoadLibrary hook family is a special case: emulation reaches
+        # auxiliary heap/string APIs and then returns through Themida's own
+        # bookkeeping instead of ending at the real export.  Older code
+        # consequently labelled the hook as an internal application call and
+        # preserved a dependency on stale protector heap objects.  The full
+        # 258-byte family layout gives us a sufficiently strict resolver.
+        if arch == Architecture.X86_32:
+            known_export_name = _identify_themida_load_library_wrapper(
+                wrapper_addr, get_data)
+            if known_export_name is not None:
+                resolved_addr = _find_unhooked_export(
+                    known_export_name, wrapper_addr, exports_dict,
+                    process_controller)
+                if resolved_addr is not None:
+                    LOG.debug("Recognized Themida loader wrapper: %s -> %s",
+                              hex(wrapper_addr), known_export_name)
+                    resolved_wrappers[wrapper_addr] = resolved_addr
+                    api_to_calls[resolved_addr].append(
+                        (call_addr, call_size, instr_was_jmp))
+                    record["structural_wrapper"] = known_export_name
+                    record_resolution(record, "themida_loadlibrary_family",
+                                      resolved_addr)
+                    continue
+                record["structural_wrapper"] = known_export_name
+                record["structural_resolution_error"] = (
+                    f"export {known_export_name} is not loaded")
 
         # If 32-bit executable, try hash-matching
         if export_hashes is not None and arch == Architecture.X86_32:

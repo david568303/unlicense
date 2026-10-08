@@ -31,6 +31,8 @@ from unlicense.process_control import (Architecture, MemoryRange,
 from unlicense.winlicense2 import (_generate_export_hashes,
                                    _generate_new_iat_in_process,
                                    _fix_import_references_in_process,
+                                   _find_unhooked_export,
+                                   _identify_themida_load_library_wrapper,
                                    _resolve_imports, _write_diagnostic_report)
 
 
@@ -172,6 +174,27 @@ def _relative_branch(opcode: int, instruction_address: int,
                      destination: int) -> bytes:
     displacement = destination - (instruction_address + 5)
     return bytes([opcode]) + struct.pack("<i", displacement)
+
+
+def _themida_load_library_family_fixture() -> bytes:
+    def simple(seed: int) -> bytes:
+        marker = struct.pack("<I", seed)
+        return (bytes.fromhex("5589e583ec0452e8000000005a81ea") +
+                marker + bytes.fromhex("ffb2") + marker + bytes([0xe8]) +
+                marker + bytes.fromhex("52ff7508e8") + marker +
+                bytes.fromhex("5a6a0050e8") + marker +
+                bytes.fromhex("5ac9c20400"))
+
+    def extended(seed: int) -> bytes:
+        marker = struct.pack("<I", seed)
+        return (bytes.fromhex("5589e583ec0452e8000000005a81ea") +
+                marker + bytes.fromhex("ffb2") + marker + bytes([0xe8]) +
+                marker + bytes.fromhex("52ff7510ff750cff7508e8") + marker +
+                bytes.fromhex(
+                    "5a538b5d1083e36285db0f8509000000ff751050e8") +
+                marker + bytes.fromhex("5b5ac9c20c00"))
+
+    return simple(1) + simple(2) + extended(3) + extended(4)
 
 
 class HeapWrapperEmulationTests(unittest.TestCase):
@@ -895,6 +918,90 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual({}, imports)
         self.assertEqual("internal_call", diagnostics[0]["resolution_method"])
         self.assertTrue(diagnostics[0]["emulation"]["returned_without_export"])
+
+    def test_themida_load_library_family_resolves_stale_internal_hook(
+            self) -> None:
+        family = _themida_load_library_family_fixture()
+        self.assertEqual(0x102, len(family))
+        family_address = 0x402100
+        member_offsets = (0x00, 0x35, 0x6a, 0xb6)
+        export_names = ("LoadLibraryA", "LoadLibraryW", "LoadLibraryExA",
+                        "LoadLibraryExW")
+        export_addresses = tuple(0x76001000 + index * 0x100
+                                 for index in range(4))
+        wrapper_page = bytearray(0x1000)
+        wrapper_page[0x100:0x100 + len(family)] = family
+        call_page = bytearray(0x1000)
+        wrapper_set = set()
+        exports: Dict[int, Dict[str, Any]] = {}
+        for index, (member_offset, export_name, export_address) in enumerate(
+                zip(member_offsets, export_names, export_addresses)):
+            call_address = 0x401000 + index * 0x10
+            wrapper_address = family_address + member_offset
+            call_page[index * 0x10:index * 0x10 + 5] = _relative_branch(
+                0xe9, call_address, wrapper_address)
+            wrapper_set.add(
+                (call_address, 5, True, wrapper_address, None))
+            exports[export_address] = {
+                "name": export_name,
+                "module": "kernel32.dll",
+            }
+
+        controller = FakeProcessController({
+            0x401000: bytes(call_page),
+            0x402000: bytes(wrapper_page),
+        }, exports)
+        for member_offset in member_offsets:
+            controller.module_addresses[family_address + member_offset] = {
+                "name": "fixture.exe",
+                "base": "0x400000",
+                "size": 0x100000,
+            }
+        # Themida hooks name-based lookup too. The resolver must prefer the
+        # enumerated external export and reject this circular answer.
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        with patch.object(controller, "find_export_by_name",
+                          return_value=family_address):
+            diagnostics = _resolve_imports(imports, wrapper_set, None,
+                                           exports, disassembler, controller)
+
+        for index, (export_address, export_name) in enumerate(
+                zip(export_addresses, export_names)):
+            self.assertEqual([(0x401000 + index * 0x10, 5, True)],
+                             imports[export_address])
+            record = next(
+                item for item in diagnostics
+                if item["call_address"] == hex(0x401000 + index * 0x10))
+            self.assertEqual("themida_loadlibrary_family",
+                             record["resolution_method"])
+            self.assertEqual(export_name, record["structural_wrapper"])
+
+    def test_themida_load_library_signature_rejects_partial_family(
+            self) -> None:
+        family = _themida_load_library_family_fixture()
+        base = 0x500000
+
+        def get_data(address: int, size: int) -> bytes:
+            offset = address - base
+            if offset < 0 or offset + size > len(family) - 1:
+                raise ReadProcessMemoryError
+            return family[offset:offset + size]
+
+        self.assertIsNone(
+            _identify_themida_load_library_wrapper(base, get_data))
+
+    def test_unhooked_export_rejects_name_lookup_back_into_wrapper(self) -> None:
+        controller = FakeProcessController({}, {})
+        wrapper = 0x402000
+
+        with patch.object(controller, "find_export_by_name",
+                          return_value=wrapper):
+            self.assertIsNone(
+                _find_unhooked_export("LoadLibraryA", wrapper, {},
+                                      controller))
 
     def test_external_code_target_is_not_rewritten_on_hash_collision(
             self) -> None:
