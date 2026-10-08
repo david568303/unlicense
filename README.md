@@ -116,6 +116,10 @@ important for single-file bundles that append DLLs or metadata after the PE
 sections. Unlicense also writes `unpacked_<target>.validation.json` beside the
 dump. This bounded post-build check records the recovered entry point, section
 layout, import/IAT directories, resource preservation, and overlay size.
+Scylla fallback IAT results are validated against loaded exports and capped;
+unbounded advanced-search matches are discarded instead of feeding a
+multi-megabyte false table to the PE rebuilder. The live target is terminated
+as soon as memory capture finishes, before the file-only reconstruction phase.
 
 Unlicense is not a remote dumper: Frida starts the target locally and Scylla
 opens that local process ID.  Consequently, running Unlicense on Windows 10/11

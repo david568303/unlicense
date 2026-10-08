@@ -17,6 +17,104 @@ from .process_control import MemoryRange, ProcessController
 
 LOG = logging.getLogger(__name__)
 
+# Scylla's advanced search is deliberately permissive and can return a range
+# that extends far beyond the real IAT on heavily obfuscated images.  Never
+# hand an unbounded candidate to Scylla/LIEF: on a 32-bit process a multi-MiB
+# range represents hundreds of thousands of imports and can keep rebuilding at
+# 100% CPU for hours.
+MAX_FALLBACK_IAT_ENTRIES = 65536
+MAX_FALLBACK_IAT_INVALID_RUN = 16
+MIN_FALLBACK_IAT_EXPORTS = 2
+MIN_FALLBACK_IAT_DENSITY = 0.5
+
+
+def _sanitize_fallback_iat(process_controller: ProcessController,
+                           iat_addr: int,
+                           reported_size: int) -> Tuple[int, int]:
+    """Validate and trim a Scylla IAT candidate against loaded exports."""
+    pointer_size = process_controller.pointer_size
+    if iat_addr <= 0 or reported_size < pointer_size:
+        return 0, 0
+
+    exports = process_controller.enumerate_exported_functions()
+    if not exports:
+        LOG.warning("Rejecting Scylla IAT candidate at %s: no loaded exports "
+                    "are available for validation", hex(iat_addr))
+        return 0, 0
+
+    scan_size = min(reported_size,
+                    MAX_FALLBACK_IAT_ENTRIES * pointer_size)
+    scan_size -= scan_size % pointer_size
+    pointer_fmt = pointer_size_to_fmt(pointer_size)
+    valid_exports = 0
+    entries_examined = 0
+    consecutive_invalid = 0
+    last_valid_end = 0
+    found_end = False
+    offset = 0
+
+    # Read a page at a time so a bogus multi-MiB result cannot trigger one
+    # large Frida allocation/RPC.  The candidate and page boundaries are
+    # pointer-aligned in supported Windows processes.
+    while offset < scan_size:
+        address = iat_addr + offset
+        bytes_to_page_end = process_controller.page_size - (
+            address % process_controller.page_size)
+        chunk_size = min(bytes_to_page_end, scan_size - offset)
+        chunk_size -= chunk_size % pointer_size
+        if chunk_size == 0:
+            break
+        try:
+            chunk = process_controller.read_process_memory(
+                address, chunk_size)
+        except Exception as error:
+            LOG.debug("Stopped validating Scylla IAT at %s: %s",
+                      hex(address), error)
+            break
+
+        for chunk_offset in range(0, len(chunk), pointer_size):
+            value = struct.unpack_from(pointer_fmt, chunk, chunk_offset)[0]
+            entries_examined += 1
+            if value in exports:
+                valid_exports += 1
+                consecutive_invalid = 0
+                last_valid_end = offset + chunk_offset + pointer_size
+            else:
+                consecutive_invalid += 1
+                if consecutive_invalid >= MAX_FALLBACK_IAT_INVALID_RUN:
+                    found_end = True
+                    break
+        if found_end:
+            break
+        offset += chunk_size
+
+    span_entries = last_valid_end // pointer_size
+    density = (valid_exports / span_entries) if span_entries else 0.0
+    if valid_exports < MIN_FALLBACK_IAT_EXPORTS or \
+            density < MIN_FALLBACK_IAT_DENSITY:
+        LOG.warning(
+            "Rejecting Scylla IAT candidate at %s, reported size=%s: "
+            "%d/%d entries resolve to loaded exports", hex(iat_addr),
+            hex(reported_size), valid_exports, entries_examined)
+        return 0, 0
+
+    if reported_size > scan_size and not found_end:
+        LOG.warning(
+            "Rejecting unbounded Scylla IAT candidate at %s, reported "
+            "size=%s: no table end was found within %d entries",
+            hex(iat_addr), hex(reported_size), MAX_FALLBACK_IAT_ENTRIES)
+        return 0, 0
+
+    # Preserve one separator/terminator after the final export pointer.  If
+    # Scylla supplied an exact shorter range, never extend it.
+    trimmed_size = min(reported_size, last_valid_end + pointer_size)
+    if trimmed_size != reported_size:
+        LOG.warning(
+            "Trimmed Scylla IAT candidate at %s from %s to %s after "
+            "validating %d export pointers", hex(iat_addr),
+            hex(reported_size), hex(trimmed_size), valid_exports)
+    return iat_addr, trimmed_size
+
 
 def _search_fallback_iat(process_controller: ProcessController,
                          image_base: int, oep: int) -> Tuple[int, int]:
@@ -30,7 +128,10 @@ def _search_fallback_iat(process_controller: ProcessController,
                       "advanced" if advanced else "basic", error)
             continue
         if iat_addr > 0 and iat_size >= process_controller.pointer_size:
-            return int(iat_addr), int(iat_size)
+            validated = _sanitize_fallback_iat(process_controller,
+                                               int(iat_addr), int(iat_size))
+            if validated[1] > 0:
+                return validated
     return 0, 0
 
 
@@ -152,6 +253,20 @@ def dump_pe(
             effective_iat_addr = 0
             effective_iat_size = 0
             iat_strategy = "preserved_after_iat_failure"
+
+        # All remaining operations are file-only.  Keeping a heavily packed
+        # GUI target alive while Scylla and LIEF rebuild the dump wastes CPU,
+        # lets it spawn children, and makes a slow rebuild look like a target
+        # wait.  Cleanup remains idempotent in application.run_unlicense().
+        LOG.info("Live-memory capture complete; terminating target before "
+                 "file reconstruction")
+        try:
+            process_controller.terminate_process()
+        except Exception as error:
+            # The outer application cleanup retries this operation.  A target
+            # teardown failure must not discard a successfully captured dump.
+            LOG.warning("Could not terminate the target before file "
+                        "reconstruction: %s", error)
 
         try:
             pyscylla.rebuild_pe(TMP_FILE_PATH2, False, True, False)

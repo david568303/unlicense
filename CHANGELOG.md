@@ -22,6 +22,13 @@
   `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
+- Validate Scylla fallback IAT candidates against loaded exports, trim them at
+  a bounded table end, and reject unbounded advanced-search false positives.
+  This prevents multi-megabyte garbage ranges from consuming a CPU core
+  indefinitely during PE rebuilding.
+- Terminate the live target immediately after memory capture and IAT
+  materialization; Scylla/LIEF file reconstruction no longer leaves the
+  protected application running in the background.
 - Use Scylla's native IAT search when Themida 2.x recovery produces no imports.
   If no runtime IAT exists, skip `fix_iat(0, 0)` and preserve the memory dump's
   existing import directory instead of rebuilding it from an empty table.

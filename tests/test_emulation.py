@@ -1,4 +1,5 @@
 import json
+import os
 import struct
 import tempfile
 import threading
@@ -15,7 +16,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore
 from unlicense.application import (_create_primary_process,
                                    _create_probe_process, _normalize_cli_bool,
                                    _wait_for_event_with_progress)
-from unlicense.dump_utils import (_materialize_iat_input, _resize_pe,
+from unlicense.dump_utils import (dump_pe, _materialize_iat_input, _resize_pe,
                                   _search_fallback_iat)
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
 from unlicense.frida_exec import (FridaProcessController, _call_with_timeout,
@@ -309,16 +310,78 @@ class HeapWrapperEmulationTests(unittest.TestCase):
                              output.read_bytes())
 
     def test_scylla_iat_search_retries_in_advanced_mode(self) -> None:
-        controller = FakeProcessController({}, {})
+        first_export = 0x77001000
+        second_export = 0x77002000
+        iat_page = (struct.pack("<II", first_export, second_export) +
+                    bytes(0x1000 - 8))
+        controller = FakeProcessController(
+            {0x6400000: iat_page}, {
+                first_export: {
+                    "name": "FirstExport"
+                },
+                second_export: {
+                    "name": "SecondExport"
+                },
+            })
         with patch("unlicense.dump_utils.pyscylla.search_iat",
                    side_effect=[(0, 0), (0x6400000, 0x80)]) as search_iat:
             result = _search_fallback_iat(controller, 0x400000, 0xd54c3f)
 
-        self.assertEqual((0x6400000, 0x80), result)
+        self.assertEqual((0x6400000, 0xc), result)
         self.assertEqual([
             ((controller.pid, 0x400000, 0xd54c3f, False), {}),
             ((controller.pid, 0x400000, 0xd54c3f, True), {}),
         ], search_iat.call_args_list)
+
+    def test_scylla_rejects_unbounded_false_positive_iat(self) -> None:
+        # This mirrors the 0x330a1c advanced-search result observed on the
+        # bundled fixture.  Random readable memory is not an import table.
+        controller = FakeProcessController({0x873000: bytes(0x1000)}, {
+            0x77001000: {
+                "name": "RealExport"
+            }
+        })
+        with patch("unlicense.dump_utils.pyscylla.search_iat",
+                   side_effect=[(0, 0), (0x8736e0, 0x330a1c)]):
+            result = _search_fallback_iat(controller, 0x400000, 0xd54c3f)
+
+        self.assertEqual((0, 0), result)
+
+    def test_dump_terminates_target_before_file_rebuild(self) -> None:
+        controller = FakeProcessController({}, {})
+        events: List[str] = []
+
+        def dump_to_file(_pid: int, _base: int, _oep: int, path: str,
+                         _original: str) -> None:
+            Path(path).write_bytes(b"memory image")
+
+        def terminate() -> None:
+            events.append("terminate")
+            controller.terminate_count += 1
+
+        controller.terminate_process = terminate  # type: ignore
+        with tempfile.TemporaryDirectory() as directory:
+            previous_directory = os.getcwd()
+            os.chdir(directory)
+            try:
+                with patch("unlicense.dump_utils._search_fallback_iat",
+                           return_value=(0, 0)), patch(
+                               "unlicense.dump_utils.pyscylla.dump_pe",
+                               side_effect=dump_to_file), patch(
+                                   "unlicense.dump_utils.pyscylla.rebuild_pe",
+                                   side_effect=lambda *_args: events.append(
+                                       "rebuild")), patch(
+                                           "unlicense.dump_utils._fix_pe"), \
+                        patch("unlicense.dump_utils._validate_dump",
+                              return_value={"valid": True, "issues": []}):
+                    result = dump_pe(controller, "fixture.exe", 0x400000,
+                                     0xd54c3f, 0, 0, True)
+            finally:
+                os.chdir(previous_directory)
+
+        self.assertTrue(result)
+        self.assertEqual(["terminate", "rebuild"], events)
+        self.assertEqual(1, controller.terminate_count)
 
     def test_zero_iat_preserves_unmodified_memory_dump(self) -> None:
         controller = FakeProcessController({}, {})
