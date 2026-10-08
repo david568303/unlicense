@@ -19,6 +19,10 @@
   section, import directories, resources, and bundle overlay.
 
 ### Fixed
+- Return native wrapper-trace results before Frida Stalker code-cache
+  reclamation and scale the bounded collection deadline with the trace window.
+  This prevents a successful 60-second trace of a heavily threaded bundle from
+  being discarded by the previous fixed ten-second collection timeout.
 - Normalize all CLI boolean values independently of capitalization. With Fire
   0.4, a value such as `--active_wrapper_probe=false` previously arrived as a
   truthy string and unexpectedly enabled the sacrificial trace.

@@ -53,6 +53,17 @@ def _call_with_timeout(operation: Callable[[], T], timeout_ms: int,
     return result[0]
 
 
+def _wrapper_trace_collection_timeout(trace_timeout_ms: int) -> int:
+    """Return a bounded deadline for serializing a completed native trace.
+
+    Collection has to unfollow every observed target thread and serialize the
+    trace result.  A fixed ten-second deadline is too short for large bundled
+    applications after a long trace, but this RPC must still remain bounded if
+    the injected agent becomes unresponsive.
+    """
+    return max(10000, min(30000, max(0, trace_timeout_ms) // 2 + 5000))
+
+
 class FridaProcessController(ProcessController):
 
     def __init__(self, pid: int, main_module_name: str,
@@ -123,6 +134,7 @@ class FridaProcessController(ProcessController):
             active_probe_timeout_ms: int = 5000,
             active_probe_profile: str = "zero") -> Dict[int, int]:
         rpc_grace_ms = 10000
+        collection_grace_ms = _wrapper_trace_collection_timeout(timeout_ms)
 
         def setup_trace() -> None:
             self._frida_rpc.setup_wrapper_trace(wrappers,
@@ -147,7 +159,7 @@ class FridaProcessController(ProcessController):
                                Any] = self._frida_rpc.collect_wrapper_trace()
             return trace_result
 
-        trace_data = _call_with_timeout(collect_trace, rpc_grace_ms,
+        trace_data = _call_with_timeout(collect_trace, collection_grace_ms,
                                         "collect wrapper trace")
         value: List[Dict[str, Any]] = trace_data.get("results", [])
         stats: Optional[Dict[str, Any]] = trace_data.get("stats")

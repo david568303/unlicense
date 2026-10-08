@@ -17,7 +17,8 @@ from unlicense.application import (_create_primary_process,
                                    _wait_for_event_with_progress)
 from unlicense.dump_utils import _resize_pe
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
-from unlicense.frida_exec import FridaProcessController, _call_with_timeout
+from unlicense.frida_exec import (FridaProcessController, _call_with_timeout,
+                                  _wrapper_trace_collection_timeout)
 from unlicense.function_hashing import (compute_function_hash,
                                         EMPTY_FUNCTION_HASH)
 from unlicense.imports import ImportToCallSiteDict
@@ -172,6 +173,24 @@ class HeapWrapperEmulationTests(unittest.TestCase):
                 _call_with_timeout(lambda: release.wait(), 1, "test RPC")
         finally:
             release.set()
+
+    def test_wrapper_trace_collection_deadline_scales_but_stays_bounded(
+            self) -> None:
+        self.assertEqual(10000, _wrapper_trace_collection_timeout(0))
+        self.assertEqual(10000, _wrapper_trace_collection_timeout(10000))
+        self.assertEqual(30000, _wrapper_trace_collection_timeout(60000))
+        self.assertEqual(30000, _wrapper_trace_collection_timeout(600000))
+
+    def test_wrapper_trace_collection_skips_blocking_stalker_cleanup(
+            self) -> None:
+        script_path = (Path(__file__).parents[1] / "unlicense" / "resources" /
+                       "frida.js")
+        script = script_path.read_text(encoding="utf-8")
+        collection_body = script.split("collectWrapperTrace: function () {")[
+            1].split("getArchitecture: function", 1)[0]
+        self.assertNotIn("Stalker.flush();", collection_body)
+        self.assertNotIn("Stalker.garbageCollect();", collection_body)
+        self.assertIn("Stalker.unfollow(threadId)", collection_body)
 
     def test_termination_kills_tree_without_cleanup_rpc(self) -> None:
         controller = object.__new__(FridaProcessController)

@@ -57,6 +57,12 @@ The native fallback is disabled by default because it lets the target execute
 normally for the requested number of milliseconds. Use it only in an isolated
 test system where target-side effects are acceptable.
 
+Trace collection has its own bounded 10-to-30-second deadline, scaled from the
+requested native trace window. Stalker is detached from every observed thread,
+but its code cache is left for process teardown instead of being reclaimed
+synchronously; on heavily threaded Windows 7 bundles that reclamation could
+block Frida long enough to discard an otherwise successful trace.
+
 `--native_trace_timeout` and `--active_wrapper_probe` may be combined. The
 explicit native-trace window always runs first on the dump target; a
 sacrificial instance is started afterwards only for wrappers that remain

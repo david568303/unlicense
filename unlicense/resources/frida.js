@@ -803,22 +803,34 @@ rpc.exports = {
         if (wrapperTraceState === null) {
             return { results: [], stats: null };
         }
-        if (wrapperTraceState.pollTimer !== null) {
-            clearInterval(wrapperTraceState.pollTimer);
+        const state = wrapperTraceState;
+        // Detach the state before stopping Stalker so no timer or later RPC can
+        // append work while this snapshot is being collected.
+        wrapperTraceState = null;
+        if (state.pollTimer !== null) {
+            clearInterval(state.pollTimer);
+            state.pollTimer = null;
         }
-        wrapperTraceState.followedThreads.forEach(threadId => {
+        let unfollowErrors = 0;
+        state.followedThreads.forEach(threadId => {
             try {
                 Stalker.unfollow(threadId);
             }
             catch (_error) {
                 // A followed thread may already have exited.
+                unfollowErrors++;
             }
         });
-        Stalker.flush();
-        Stalker.garbageCollect();
-        const results = Array.from(wrapperTraceState.resolutions.values());
-        const stats = wrapperTraceState.stats;
-        wrapperTraceState = null;
+        state.stats.unfollowErrors = unfollowErrors;
+        const results = Array.from(state.resolutions.values());
+        const stats = state.stats;
+
+        // Do not call Stalker.flush()/garbageCollect() here. Trace results are
+        // written synchronously by callouts, not delivered through the event
+        // queue, so flushing cannot add results. On Win7, synchronously
+        // reclaiming the code cache for dozens of threads can hold the Frida
+        // RPC dispatcher for longer than the collection deadline. The target
+        // process is torn down after dumping and will reclaim that cache.
         return { results: results, stats: stats };
     },
     getArchitecture: function () { return Process.arch; },
