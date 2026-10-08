@@ -22,6 +22,13 @@
   `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
+- Validate Scylla's materialized import descriptors against the modules that
+  were actually loaded. Unknown synthetic descriptors such as `?.DLL` now
+  discard the fallback transaction instead of producing a loader error.
+- Record bounded examples of exported API calls that native tracing observed
+  but could not safely patch, including the return window and destination.
+  This makes unsupported call-site patterns diagnosable without another noisy
+  full trace.
 - Validate Scylla fallback IAT candidates against loaded exports, trim them at
   a bounded table end, and reject unbounded advanced-search false positives.
   This prevents multi-megabyte garbage ranges from consuming a CPU core

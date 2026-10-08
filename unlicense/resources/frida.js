@@ -469,6 +469,7 @@ rpc.exports = {
                 returnHits: 0,
                 skippedFinalApis: 0,
                 unpatchableExportReturns: 0,
+                unpatchableImportSamples: [],
                 wrapperHits: 0,
                 threadIds: []
             }
@@ -539,6 +540,18 @@ rpc.exports = {
             }
             else {
                 state.stats.unpatchableExportReturns++;
+                if (state.stats.unpatchableImportSamples.length < 64) {
+                    const encodedBytes = Array.from(bytes).map(value =>
+                        value.toString(16).padStart(2, '0')).join('');
+                    state.stats.unpatchableImportSamples.push({
+                        returnAddress: returnAddress.toString(),
+                        windowAddress: windowAddress.toString(),
+                        bytes: encodedBytes,
+                        address: exportInfo.address,
+                        name: exportInfo.name,
+                        module: exportInfo.module
+                    });
+                }
                 return;
             }
 

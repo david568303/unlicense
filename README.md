@@ -120,6 +120,9 @@ Scylla fallback IAT results are validated against loaded exports and capped;
 unbounded advanced-search matches are discarded instead of feeding a
 multi-megabyte false table to the PE rebuilder. The live target is terminated
 as soon as memory capture finishes, before the file-only reconstruction phase.
+The materialized descriptors are then checked against the process's loaded
+module list. A fallback containing an unknown placeholder such as `?.DLL` is
+rolled back to the unmodified memory dump and reported in the validation JSON.
 
 Unlicense is not a remote dumper: Frida starts the target locally and Scylla
 opens that local process ID.  Consequently, running Unlicense on Windows 10/11

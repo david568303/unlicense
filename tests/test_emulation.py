@@ -17,7 +17,8 @@ from unlicense.application import (_create_primary_process,
                                    _create_probe_process, _normalize_cli_bool,
                                    _wait_for_event_with_progress)
 from unlicense.dump_utils import (dump_pe, _materialize_iat_input, _resize_pe,
-                                  _search_fallback_iat)
+                                  _search_fallback_iat,
+                                  _validate_materialized_iat)
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
 from unlicense.frida_exec import (FridaProcessController, _call_with_timeout,
                                   _wrapper_trace_collection_timeout)
@@ -196,6 +197,7 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertNotIn("Stalker.garbageCollect();", collection_body)
         self.assertIn("Stalker.unfollow(threadId)", collection_body)
         self.assertIn("observedImports", collection_body)
+        self.assertIn("unpatchableImportSamples", script)
 
     def test_termination_kills_tree_without_cleanup_rpc(self) -> None:
         controller = object.__new__(FridaProcessController)
@@ -409,6 +411,36 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         fix_iat.assert_called_once_with(controller.pid, 0x400000, 0x6400000,
                                         0x80, True, "dumped.exe",
                                         "fixed.exe")
+
+    def test_materialized_iat_rejects_unknown_scylla_module(self) -> None:
+        unknown_import = Mock(name="unknown_import")
+        unknown_import.name = "?.DLL"
+        unknown_import.entries = [Mock()]
+        binary = Mock()
+        binary.imports = [unknown_import]
+        with patch("unlicense.dump_utils.lief.PE.parse",
+                   return_value=binary):
+            valid, detail = _validate_materialized_iat(
+                "fixed.exe", ["kernel32.dll", "user32.dll"], 8)
+
+        self.assertFalse(valid)
+        self.assertIn("unknown modules", detail)
+        self.assertIn("?.DLL", detail)
+
+    def test_materialized_iat_accepts_loaded_modules_with_bounded_entries(
+            self) -> None:
+        kernel_import = Mock(name="kernel_import")
+        kernel_import.name = "KERNEL32.dll"
+        kernel_import.entries = [Mock(), Mock()]
+        binary = Mock()
+        binary.imports = [kernel_import]
+        with patch("unlicense.dump_utils.lief.PE.parse",
+                   return_value=binary):
+            valid, detail = _validate_materialized_iat(
+                "fixed.exe", ["Titanium.exe", "kernel32.dll"], 8)
+
+        self.assertTrue(valid)
+        self.assertIn("validated 2 imports", detail)
 
     def test_native_trace_result_resolves_exception_wrapper(self) -> None:
         call_site = 0x401000
