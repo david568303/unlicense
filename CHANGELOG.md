@@ -22,23 +22,21 @@
   `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
-- Validate Scylla's materialized import descriptors against the modules that
-  were actually loaded. Unknown synthetic descriptors such as `?.DLL` now
-  discard the fallback transaction instead of producing a loader error.
+- Disable automatic Scylla IAT searching when verified import recovery is
+  empty. Its advanced heuristic returned `0x330a1c` bytes of unrelated memory
+  for the test bundle; even a trimmed fragment caused an access violation
+  inside `pyscylla.fix_iat`. The native fixer now only receives IATs built from
+  verified Unlicense resolutions.
 - Record bounded examples of exported API calls that native tracing observed
   but could not safely patch, including the return window and destination.
   This makes unsupported call-site patterns diagnosable without another noisy
   full trace.
-- Validate Scylla fallback IAT candidates against loaded exports, trim them at
-  a bounded table end, and reject unbounded advanced-search false positives.
-  This prevents multi-megabyte garbage ranges from consuming a CPU core
-  indefinitely during PE rebuilding.
 - Terminate the live target immediately after memory capture and IAT
   materialization; Scylla/LIEF file reconstruction no longer leaves the
   protected application running in the background.
-- Use Scylla's native IAT search when Themida 2.x recovery produces no imports.
-  If no runtime IAT exists, skip `fix_iat(0, 0)` and preserve the memory dump's
-  existing import directory instead of rebuilding it from an empty table.
+- When Themida 2.x recovery produces no imports, skip `fix_iat(0, 0)` and
+  preserve the memory dump's existing import directory instead of rebuilding
+  it from an empty table.
 - Revalidate every dynamically observed call site on the host and only patch
   six-byte Themida patterns with one stable export destination. Conflicting or
   ordinary five-byte calls are preserved rather than overwritten.

@@ -17,123 +17,6 @@ from .process_control import MemoryRange, ProcessController
 
 LOG = logging.getLogger(__name__)
 
-# Scylla's advanced search is deliberately permissive and can return a range
-# that extends far beyond the real IAT on heavily obfuscated images.  Never
-# hand an unbounded candidate to Scylla/LIEF: on a 32-bit process a multi-MiB
-# range represents hundreds of thousands of imports and can keep rebuilding at
-# 100% CPU for hours.
-MAX_FALLBACK_IAT_ENTRIES = 65536
-MAX_FALLBACK_IAT_INVALID_RUN = 16
-MIN_FALLBACK_IAT_EXPORTS = 2
-MIN_FALLBACK_IAT_DENSITY = 0.5
-
-
-def _sanitize_fallback_iat(process_controller: ProcessController,
-                           iat_addr: int,
-                           reported_size: int) -> Tuple[int, int]:
-    """Validate and trim a Scylla IAT candidate against loaded exports."""
-    pointer_size = process_controller.pointer_size
-    if iat_addr <= 0 or reported_size < pointer_size:
-        return 0, 0
-
-    exports = process_controller.enumerate_exported_functions()
-    if not exports:
-        LOG.warning("Rejecting Scylla IAT candidate at %s: no loaded exports "
-                    "are available for validation", hex(iat_addr))
-        return 0, 0
-
-    scan_size = min(reported_size,
-                    MAX_FALLBACK_IAT_ENTRIES * pointer_size)
-    scan_size -= scan_size % pointer_size
-    pointer_fmt = pointer_size_to_fmt(pointer_size)
-    valid_exports = 0
-    entries_examined = 0
-    consecutive_invalid = 0
-    last_valid_end = 0
-    found_end = False
-    offset = 0
-
-    # Read a page at a time so a bogus multi-MiB result cannot trigger one
-    # large Frida allocation/RPC.  The candidate and page boundaries are
-    # pointer-aligned in supported Windows processes.
-    while offset < scan_size:
-        address = iat_addr + offset
-        bytes_to_page_end = process_controller.page_size - (
-            address % process_controller.page_size)
-        chunk_size = min(bytes_to_page_end, scan_size - offset)
-        chunk_size -= chunk_size % pointer_size
-        if chunk_size == 0:
-            break
-        try:
-            chunk = process_controller.read_process_memory(
-                address, chunk_size)
-        except Exception as error:
-            LOG.debug("Stopped validating Scylla IAT at %s: %s",
-                      hex(address), error)
-            break
-
-        for chunk_offset in range(0, len(chunk), pointer_size):
-            value = struct.unpack_from(pointer_fmt, chunk, chunk_offset)[0]
-            entries_examined += 1
-            if value in exports:
-                valid_exports += 1
-                consecutive_invalid = 0
-                last_valid_end = offset + chunk_offset + pointer_size
-            else:
-                consecutive_invalid += 1
-                if consecutive_invalid >= MAX_FALLBACK_IAT_INVALID_RUN:
-                    found_end = True
-                    break
-        if found_end:
-            break
-        offset += chunk_size
-
-    span_entries = last_valid_end // pointer_size
-    density = (valid_exports / span_entries) if span_entries else 0.0
-    if valid_exports < MIN_FALLBACK_IAT_EXPORTS or \
-            density < MIN_FALLBACK_IAT_DENSITY:
-        LOG.warning(
-            "Rejecting Scylla IAT candidate at %s, reported size=%s: "
-            "%d/%d entries resolve to loaded exports", hex(iat_addr),
-            hex(reported_size), valid_exports, entries_examined)
-        return 0, 0
-
-    if reported_size > scan_size and not found_end:
-        LOG.warning(
-            "Rejecting unbounded Scylla IAT candidate at %s, reported "
-            "size=%s: no table end was found within %d entries",
-            hex(iat_addr), hex(reported_size), MAX_FALLBACK_IAT_ENTRIES)
-        return 0, 0
-
-    # Preserve one separator/terminator after the final export pointer.  If
-    # Scylla supplied an exact shorter range, never extend it.
-    trimmed_size = min(reported_size, last_valid_end + pointer_size)
-    if trimmed_size != reported_size:
-        LOG.warning(
-            "Trimmed Scylla IAT candidate at %s from %s to %s after "
-            "validating %d export pointers", hex(iat_addr),
-            hex(reported_size), hex(trimmed_size), valid_exports)
-    return iat_addr, trimmed_size
-
-
-def _search_fallback_iat(process_controller: ProcessController,
-                         image_base: int, oep: int) -> Tuple[int, int]:
-    """Ask Scylla for an existing runtime IAT when custom recovery found none."""
-    for advanced in (False, True):
-        try:
-            iat_addr, iat_size = pyscylla.search_iat(
-                process_controller.pid, image_base, oep, advanced)
-        except pyscylla.ScyllaException as error:
-            LOG.debug("Scylla %s IAT search failed: %s",
-                      "advanced" if advanced else "basic", error)
-            continue
-        if iat_addr > 0 and iat_size >= process_controller.pointer_size:
-            validated = _sanitize_fallback_iat(process_controller,
-                                               int(iat_addr), int(iat_size))
-            if validated[1] > 0:
-                return validated
-    return 0, 0
-
 
 def _materialize_iat_input(process_controller: ProcessController,
                            image_base: int, iat_addr: int, iat_size: int,
@@ -146,44 +29,6 @@ def _materialize_iat_input(process_controller: ProcessController,
     pyscylla.fix_iat(process_controller.pid, image_base, iat_addr, iat_size,
                      add_new_iat, dumped_path, output_path)
     return True
-
-
-def _validate_materialized_iat(file_path: str,
-                               loaded_modules: List[str],
-                               maximum_entries: int) -> Tuple[bool, str]:
-    """Reject a Scylla-produced import table with synthetic/unknown DLLs."""
-    try:
-        binary = lief.PE.parse(file_path)
-        if binary is None:
-            return False, "the intermediate file is not a parseable PE"
-
-        imports = list(binary.imports)
-        if not imports:
-            return False, "Scylla produced no import descriptors"
-
-        loaded_names = {
-            os.path.basename(str(module)).lower()
-            for module in loaded_modules if str(module).strip()
-        }
-        imported_names = [str(imported.name).strip() for imported in imports]
-        invalid_names = [
-            name for name in imported_names
-            if not name or os.path.basename(name).lower() not in loaded_names
-        ]
-        if invalid_names:
-            return False, ("Scylla produced import descriptors for unknown "
-                           f"modules: {invalid_names!r}")
-
-        entry_count = sum(len(imported.entries) for imported in imports)
-        if entry_count == 0:
-            return False, "Scylla produced empty import descriptors"
-        if entry_count > maximum_entries:
-            return False, (f"Scylla produced {entry_count} imports from a "
-                           f"candidate containing at most {maximum_entries}")
-        return True, (f"validated {entry_count} imports from "
-                      f"{len(imports)} loaded module(s)")
-    except Exception as error:
-        return False, f"failed to validate Scylla imports: {error}"
 
 
 def get_section_ranges(pe_file_path: str) -> List[MemoryRange]:
@@ -251,20 +96,13 @@ def dump_pe(
     effective_iat_size = iat_size
     effective_add_new_iat = add_new_iat
     iat_strategy = "recovered"
-    iat_validation_detail: Optional[str] = None
     if effective_iat_size == 0:
-        effective_iat_addr, effective_iat_size = _search_fallback_iat(
-            process_controller, image_base, oep)
-        if effective_iat_size > 0:
-            effective_add_new_iat = True
-            iat_strategy = "scylla_search"
-            LOG.info("Scylla fallback IAT found at %s, size=%s",
-                     hex(effective_iat_addr), hex(effective_iat_size))
-        else:
-            iat_strategy = "preserved_dump"
-            LOG.warning(
-                "No runtime IAT was found; preserving the dumped image's "
-                "existing import directory instead of rebuilding an empty IAT")
+        iat_strategy = "preserved_dump"
+        LOG.warning(
+            "No verified runtime IAT was recovered; preserving the dumped "
+            "image's existing import directory. Automatic Scylla IAT search "
+            "is disabled because malformed heuristic results can crash its "
+            "native fix_iat routine")
 
     with TemporaryDirectory() as tmp_dir:
         TMP_FILE_PATH1 = os.path.join(tmp_dir, "unlicense.dump")
@@ -278,48 +116,20 @@ def dump_pe(
 
         LOG.info("Fixing dump ...")
         try:
-            iat_was_materialized = _materialize_iat_input(
+            _materialize_iat_input(
                 process_controller, image_base, effective_iat_addr,
                 effective_iat_size, effective_add_new_iat, TMP_FILE_PATH1,
                 TMP_FILE_PATH2)
         except pyscylla.ScyllaException as scylla_exception:
-            # A false-positive Scylla search should not destroy an otherwise
-            # useful raw dump. Keep the original directories as a bounded
-            # fallback and make the strategy explicit in diagnostics.
+            # A native reconstruction failure should not destroy an otherwise
+            # useful raw dump. Keep the original directories as a fallback
+            # and make the strategy explicit in diagnostics.
             LOG.warning("Failed to fix the discovered IAT: %s; preserving "
                         "the unmodified memory dump", str(scylla_exception))
             shutil.copyfile(TMP_FILE_PATH1, TMP_FILE_PATH2)
             effective_iat_addr = 0
             effective_iat_size = 0
             iat_strategy = "preserved_after_iat_failure"
-            iat_was_materialized = False
-
-        if iat_was_materialized and iat_strategy == "scylla_search":
-            try:
-                loaded_modules = process_controller.enumerate_modules()
-            except Exception as error:
-                loaded_modules = []
-                iat_validation_detail = \
-                    f"failed to enumerate loaded modules: {error}"
-            if iat_validation_detail is None:
-                iat_is_valid, iat_validation_detail = \
-                    _validate_materialized_iat(
-                        TMP_FILE_PATH2, loaded_modules,
-                        effective_iat_size // max(
-                            1, process_controller.pointer_size))
-            else:
-                iat_is_valid = False
-            if not iat_is_valid:
-                LOG.warning("Discarding unsafe Scylla fallback IAT: %s; "
-                            "preserving the unmodified memory dump",
-                            iat_validation_detail)
-                shutil.copyfile(TMP_FILE_PATH1, TMP_FILE_PATH2)
-                effective_iat_addr = 0
-                effective_iat_size = 0
-                iat_strategy = "preserved_after_iat_validation"
-            else:
-                LOG.info("Scylla fallback IAT passed structural validation: "
-                         "%s", iat_validation_detail)
 
         # All remaining operations are file-only.  Keeping a heavily packed
         # GUI target alive while Scylla and LIEF rebuild the dump wastes CPU,
@@ -351,7 +161,6 @@ def dump_pe(
         validation["iat_reconstruction_strategy"] = iat_strategy
         validation["runtime_iat_address"] = hex(effective_iat_addr)
         validation["runtime_iat_size"] = effective_iat_size
-        validation["iat_validation_detail"] = iat_validation_detail
         validation_path = f"{output_file_name}.validation.json"
         try:
             with open(validation_path, "w", encoding="utf-8") as report_file:

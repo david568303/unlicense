@@ -70,10 +70,12 @@ the host revalidates each call site before patching it. A call site observed
 with different export destinations or without enough patch space is left
 untouched and reported in the diagnostic JSON.
 
-If neither static nor native wrapper recovery produces an import, Unlicense now
-asks Scylla to search the live process for an existing IAT. When that also
-fails, it preserves the dumped image's existing import directory and bypasses
-Scylla's empty-table reconstruction. The validation JSON records the selected
+If neither static nor native wrapper recovery produces an import, Unlicense
+preserves the dumped image's existing import directory and bypasses Scylla's
+empty-table reconstruction. Automatic Scylla IAT searching is intentionally
+disabled: its permissive advanced heuristic can return unrelated mapped memory
+and malformed candidates have been observed to crash the native fixer before
+Python can recover. The validation JSON records the selected
 `iat_reconstruction_strategy` and runtime IAT range.
 
 `--native_trace_timeout` and `--active_wrapper_probe` may be combined. The
@@ -116,13 +118,8 @@ important for single-file bundles that append DLLs or metadata after the PE
 sections. Unlicense also writes `unpacked_<target>.validation.json` beside the
 dump. This bounded post-build check records the recovered entry point, section
 layout, import/IAT directories, resource preservation, and overlay size.
-Scylla fallback IAT results are validated against loaded exports and capped;
-unbounded advanced-search matches are discarded instead of feeding a
-multi-megabyte false table to the PE rebuilder. The live target is terminated
-as soon as memory capture finishes, before the file-only reconstruction phase.
-The materialized descriptors are then checked against the process's loaded
-module list. A fallback containing an unknown placeholder such as `?.DLL` is
-rolled back to the unmodified memory dump and reported in the validation JSON.
+The live target is terminated as soon as memory capture finishes, before the
+file-only reconstruction phase.
 
 Unlicense is not a remote dumper: Frida starts the target locally and Scylla
 opens that local process ID.  Consequently, running Unlicense on Windows 10/11
