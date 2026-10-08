@@ -1,10 +1,11 @@
 import json
 import struct
 import tempfile
+import threading
 import unittest
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import Mock, patch
 
 from unicorn import (  # type: ignore
@@ -12,6 +13,7 @@ from unicorn import (  # type: ignore
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore
 
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
+from unlicense.frida_exec import _call_with_timeout
 from unlicense.imports import ImportToCallSiteDict
 from unlicense.process_control import (Architecture, MemoryRange,
                                        ProcessController,
@@ -32,6 +34,7 @@ class FakeProcessController(ProcessController):
         self.active_probe_timeout = 0
         self.trace_wrappers: List[Dict[str, Any]] = []
         self.trace_error: Optional[Exception] = None
+        self.trace_call_count = 0
         self.terminate_count = 0
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
@@ -77,6 +80,7 @@ class FakeProcessController(ProcessController):
             active_probe: bool = False,
             active_probe_timeout_ms: int = 5000) -> Dict[int, int]:
         self.trace_wrappers = wrappers
+        self.trace_call_count += 1
         self.trace_timeout = timeout_ms
         self.active_probe = active_probe
         self.active_probe_timeout = active_probe_timeout_ms
@@ -119,6 +123,15 @@ def _relative_branch(opcode: int, instruction_address: int,
 
 
 class HeapWrapperEmulationTests(unittest.TestCase):
+
+    def test_blocking_frida_rpc_has_host_side_deadline(self) -> None:
+        release = threading.Event()
+        try:
+            with self.assertRaisesRegex(TimeoutError,
+                                        "test RPC timed out after 1 ms"):
+                _call_with_timeout(lambda: release.wait(), 1, "test RPC")
+        finally:
+            release.set()
 
     def test_native_trace_result_resolves_exception_wrapper(self) -> None:
         call_site = 0x401000
@@ -267,6 +280,83 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertEqual(1, failed_probe.terminate_count)
         self.assertEqual(1, successful_probe.terminate_count)
         self.assertEqual(0, main_controller.terminate_count)
+
+    def test_active_trace_reuses_live_sacrificial_process(self) -> None:
+        image_base = 0x400000
+        probe_image_base = 0x500000
+        first_call = 0x401000
+        second_call = 0x403000
+        first_wrapper = 0x402000
+        second_wrapper = 0x404000
+        first_probe_call = 0x501000
+        second_probe_call = 0x503000
+        first_probe_wrapper = 0x602000
+        second_probe_wrapper = 0x604000
+        main_apis = (0x76002000, 0x76004000)
+        probe_apis = (0x77003000, 0x77005000)
+
+        main_pages = {}
+        probe_pages = {}
+        for main_call, main_wrapper, probe_call, probe_wrapper in (
+            (first_call, first_wrapper, first_probe_call, first_probe_wrapper),
+            (second_call, second_wrapper, second_probe_call,
+             second_probe_wrapper),
+        ):
+            main_page = bytearray(0x1000)
+            main_page[0:5] = _relative_branch(0xe8, main_call, main_wrapper)
+            main_pages[main_call] = bytes(main_page)
+            main_pages[main_wrapper] = bytes([0xcc]) + bytes(0xfff)
+            probe_page = bytearray(0x1000)
+            probe_page[0:5] = _relative_branch(0xe8, probe_call, probe_wrapper)
+            probe_pages[probe_call] = bytes(probe_page)
+
+        main_controller = FakeProcessController(
+            main_pages, {
+                main_apis[0]: {
+                    "name": "FirstApi",
+                    "module": "kernel32.dll",
+                },
+                main_apis[1]: {
+                    "name": "SecondApi",
+                    "module": "kernel32.dll",
+                },
+            })
+        probe_controller = FakeProcessController(
+            probe_pages, {
+                probe_apis[0]: {
+                    "name": "FirstApi",
+                    "module": "kernel32.dll",
+                },
+                probe_apis[1]: {
+                    "name": "SecondApi",
+                    "module": "kernel32.dll",
+                },
+            })
+        probe_controller.trace_results = {
+            first_probe_call: probe_apis[0],
+            second_probe_call: probe_apis[1],
+        }
+        factory_calls = 0
+
+        def create_probe() -> Tuple[FakeProcessController, int]:
+            nonlocal factory_calls
+            factory_calls += 1
+            return probe_controller, probe_image_base
+
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+        _resolve_imports(
+            imports, {(first_call, 5, False, first_wrapper, None),
+                      (second_call, 5, False, second_wrapper, None)}, None,
+            main_controller.exports, disassembler, main_controller, 0, True,
+            5000, image_base, create_probe)
+
+        self.assertEqual([(first_call, 5, False)], imports[main_apis[0]])
+        self.assertEqual([(second_call, 5, False)], imports[main_apis[1]])
+        self.assertEqual(1, factory_calls)
+        self.assertEqual(2, probe_controller.trace_call_count)
+        self.assertEqual(1, probe_controller.terminate_count)
 
     def test_synthetic_heap_search_is_bounded(self) -> None:
         controller = FakeProcessController({}, {})

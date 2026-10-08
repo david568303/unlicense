@@ -382,6 +382,7 @@ rpc.exports = {
                 activeProbeErrors: [],
                 activeProbeReturns: 0,
                 activeProbes: 0,
+                activeExportTrail: [],
                 compiledBlocks: 0,
                 exportHits: 0,
                 returnHits: 0,
@@ -455,6 +456,15 @@ rpc.exports = {
                                 return;
                             }
                             active.lastExport = exportInfo;
+                            state.stats.activeExportTrail.push({
+                                address: exportInfo.address,
+                                name: exportInfo.name,
+                                module: exportInfo.module,
+                                stackPointer: context.sp.toString()
+                            });
+                            if (state.stats.activeExportTrail.length > 64) {
+                                state.stats.activeExportTrail.shift();
+                            }
                             try {
                                 if (context.sp.readPointer().equals(
                                         active.nativeReturn)) {
@@ -711,10 +721,10 @@ rpc.exports = {
             }
         });
         Stalker.flush();
+        Stalker.garbageCollect();
         const results = Array.from(wrapperTraceState.resolutions.values());
         const stats = wrapperTraceState.stats;
         wrapperTraceState = null;
-        setImmediate(() => Stalker.garbageCollect());
         return { results: results, stats: stats };
     },
     getArchitecture: function () { return Process.arch; },

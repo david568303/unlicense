@@ -1,9 +1,10 @@
 import functools
 import logging
+import threading
 import time
 from importlib import resources
 from pathlib import Path
-from typing import (List, Callable, Dict, Any, Optional)
+from typing import (List, Callable, Dict, Any, Optional, TypeVar)
 
 import frida
 import frida.core
@@ -22,6 +23,33 @@ _TEARDOWN_ERRORS = (frida.InvalidOperationError, frida.ProcessNotFoundError,
                     frida.TransportError, frida.core.RPCException)
 
 OepReachedCallback = Callable[[int, int, bool], None]
+T = TypeVar("T")
+
+
+def _call_with_timeout(operation: Callable[[], T], timeout_ms: int,
+                       description: str) -> T:
+    """Run a blocking Frida RPC with a host-side hard deadline."""
+    completed = threading.Event()
+    result: List[T] = []
+    errors: List[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            result.append(operation())
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=invoke,
+                              name=f"frida-rpc-{description}",
+                              daemon=True)
+    worker.start()
+    if not completed.wait(max(0.1, timeout_ms / 1000.0)):
+        raise TimeoutError(f"{description} timed out after {timeout_ms} ms")
+    if errors:
+        raise errors[0]
+    return result[0]
 
 
 class FridaProcessController(ProcessController):
@@ -83,13 +111,32 @@ class FridaProcessController(ProcessController):
             timeout_ms: int,
             active_probe: bool = False,
             active_probe_timeout_ms: int = 5000) -> Dict[int, int]:
-        self._frida_rpc.setup_wrapper_trace(wrappers, self.main_module_name)
+        rpc_grace_ms = 10000
+
+        def setup_trace() -> None:
+            self._frida_rpc.setup_wrapper_trace(wrappers,
+                                                self.main_module_name)
+
+        _call_with_timeout(setup_trace, rpc_grace_ms, "setup wrapper trace")
         if active_probe:
-            self._frida_rpc.probe_wrapper_trace(active_probe_timeout_ms)
+
+            def probe_trace() -> None:
+                self._frida_rpc.probe_wrapper_trace(active_probe_timeout_ms)
+
+            _call_with_timeout(probe_trace,
+                               active_probe_timeout_ms + rpc_grace_ms,
+                               "active wrapper probe")
         if timeout_ms > 0:
             self._frida_script.post({"type": "block_on_oep"})
             time.sleep(timeout_ms / 1000.0)
-        trace_data: Dict[str, Any] = self._frida_rpc.collect_wrapper_trace()
+
+        def collect_trace() -> Dict[str, Any]:
+            trace_result: Dict[str,
+                               Any] = self._frida_rpc.collect_wrapper_trace()
+            return trace_result
+
+        trace_data = _call_with_timeout(collect_trace, rpc_grace_ms,
+                                        "collect wrapper trace")
         value: List[Dict[str, Any]] = trace_data.get("results", [])
         stats: Optional[Dict[str, Any]] = trace_data.get("stats")
         self.last_wrapper_trace_stats = stats
@@ -232,9 +279,10 @@ def _str_to_architecture(frida_arch: str) -> Architecture:
     raise ValueError
 
 
-def spawn_and_instrument(
-        pe_path: Path, text_section_ranges: List[MemoryRange],
-        notify_oep_reached: OepReachedCallback) -> ProcessController:
+def spawn_and_instrument(pe_path: Path,
+                         text_section_ranges: List[MemoryRange],
+                         notify_oep_reached: OepReachedCallback,
+                         setup_timeout_ms: int = 15000) -> ProcessController:
     pid: int
     if pe_path.suffix == ".dll":
         # Use `rundll32` to load the DLL
@@ -260,9 +308,13 @@ def spawn_and_instrument(
         frida_rpc = script.exports
         process_controller = FridaProcessController(pid, main_module_name,
                                                     session, script)
-        frida_rpc.setup_oep_tracing(pe_path.name,
-                                    [[r.base, r.size]
-                                     for r in text_section_ranges])
+
+        def setup_oep() -> None:
+            frida_rpc.setup_oep_tracing(pe_path.name,
+                                        [[r.base, r.size]
+                                         for r in text_section_ranges])
+
+        _call_with_timeout(setup_oep, setup_timeout_ms, "setup OEP tracing")
         frida.resume(pid)
         return process_controller
     except Exception:

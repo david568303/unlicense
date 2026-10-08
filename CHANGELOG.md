@@ -14,10 +14,12 @@
 - Run active wrapper probes in a sacrificial target instance, translate call
   sites by image RVA, and map resolved exports back by module and name so the
   dump target remains intact even if speculative execution crashes.
-- Commit sacrificial probe results one wrapper at a time and restart the probe
-  process for every wrapper so crashes and silent global-state corruption do
-  not affect later attempts.
+- Commit sacrificial probe results one wrapper at a time and reuse the prepared
+  target after a contained probe timeout, avoiding repeated OEP setup stalls.
+  Restart it only after a process or RPC failure.
 - Add a bounded, configurable timeout for each active wrapper probe.
+- Add host-side hard deadlines to OEP setup and wrapper-tracing RPCs so a
+  stalled Frida agent cannot block the controller indefinitely.
 
 ### Fixed
 - Skip the final imported API during active wrapper probing so synthetic
@@ -26,6 +28,8 @@
   executing the real heap implementation with an incomplete emulated PEB.
 - Bound wrapper emulation and keep synthetic heap allocation local to Unicorn
   so a paused target cannot stall a nested Frida RPC indefinitely.
+- Preserve active-probe timeout errors and the last 64 active export hits in
+  the diagnostic report.
 - Simulate RTL string and boundary-descriptor cleanup calls used as wrapper
   noise, and report INT3-based wrappers without treating them as resolved.
 - Avoid printing raw ANSI color sequences in the Windows 7 console.

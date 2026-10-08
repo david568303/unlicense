@@ -141,12 +141,16 @@ def run_unlicense(
                     "wrapper probing; the dump target will remain blocked")
                 try:
                     assert text_section_ranges is not None
+                    startup_timeout_ms = max(
+                        5000, min(60000, active_probe_timeout * 2))
                     probe_controller = frida_exec.spawn_and_instrument(
-                        pe_path, text_section_ranges, notify_probe_oep)
-                    if not probe_oep_reached.wait(float(timeout)):
+                        pe_path, text_section_ranges, notify_probe_oep,
+                        startup_timeout_ms)
+                    if not probe_oep_reached.wait(startup_timeout_ms / 1000.0):
                         LOG.warning(
                             "Sacrificial target did not reach its OEP before "
-                            "timeout; active probing is disabled")
+                            "%d ms; active probing is disabled",
+                            startup_timeout_ms)
                         probe_controller.terminate_process()
                         probe_controller = None
                         probe_image_base = None

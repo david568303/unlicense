@@ -324,42 +324,61 @@ def _resolve_imports(
                         "target will not be probed")
         else:
             probe_timeout = max(100, min(60000, active_probe_timeout))
-            for index, record in enumerate(unresolved_records, 1):
-                probe_controller, probe_image_base = probe_process_factory()
-                if probe_controller is None or probe_image_base is None:
-                    record["probe_error"] = "sacrificial target unavailable"
-                    LOG.warning(
-                        "No sacrificial target is available for "
-                        "wrapper %d/%d", index, len(unresolved_records))
-                    break
-                try:
-                    probe_requests, probe_to_main_calls = \
-                        _build_probe_trace_requests(
-                            [record], image_base, probe_image_base, md,
-                            probe_controller)
-                    if not probe_requests:
-                        continue
-                    LOG.warning(
-                        "Actively probing wrapper %d/%d in the sacrificial "
-                        "target PID=%d (timeout=%d ms); the dump target "
-                        "remains untouched", index, len(unresolved_records),
-                        probe_controller.pid, probe_timeout)
-                    probe_results = probe_controller.trace_wrapped_imports(
-                        probe_requests, 0, True, probe_timeout)
-                    record["probe_trace_stats"] = \
-                        probe_controller.last_wrapper_trace_stats
-                    traced_imports = _translate_probe_results(
-                        probe_results, probe_to_main_calls, probe_controller,
-                        process_controller)
-                    apply_traced_imports([record], traced_imports,
-                                         "sacrificial_native_trace")
-                except Exception as error:
-                    record["probe_error"] = str(error)
-                    LOG.warning("Sacrificial wrapper %d/%d failed: %s", index,
-                                len(unresolved_records), error)
-                finally:
-                    # Never reuse a speculative process. A wrapper may have
-                    # corrupted global state even if its probe thread returned.
+            probe_controller: Optional[ProcessController] = None
+            probe_image_base: Optional[int] = None
+            try:
+                for index, record in enumerate(unresolved_records, 1):
+                    if probe_controller is None or probe_image_base is None:
+                        probe_controller, probe_image_base = \
+                            probe_process_factory()
+                    if probe_controller is None or probe_image_base is None:
+                        record["probe_error"] = \
+                            "sacrificial target unavailable"
+                        LOG.warning(
+                            "No sacrificial target is available for "
+                            "wrapper %d/%d", index, len(unresolved_records))
+                        break
+                    record["probe_pid"] = probe_controller.pid
+                    try:
+                        probe_requests, probe_to_main_calls = \
+                            _build_probe_trace_requests(
+                                [record], image_base, probe_image_base, md,
+                                probe_controller)
+                        if not probe_requests:
+                            continue
+                        LOG.warning(
+                            "Actively probing wrapper %d/%d in reusable "
+                            "sacrificial target PID=%d (timeout=%d ms); the "
+                            "dump target remains untouched", index,
+                            len(unresolved_records), probe_controller.pid,
+                            probe_timeout)
+                        probe_results = probe_controller.trace_wrapped_imports(
+                            probe_requests, 0, True, probe_timeout)
+                        stats = probe_controller.last_wrapper_trace_stats
+                        record["probe_trace_stats"] = stats
+                        if stats is not None:
+                            probe_errors = stats.get("activeProbeErrors", [])
+                            if probe_errors:
+                                record["probe_error"] = "; ".join(
+                                    str(error) for error in probe_errors)
+                        traced_imports = _translate_probe_results(
+                            probe_results, probe_to_main_calls,
+                            probe_controller, process_controller)
+                        apply_traced_imports([record], traced_imports,
+                                             "sacrificial_native_trace")
+                    except Exception as error:
+                        record["probe_error"] = str(error)
+                        LOG.warning("Sacrificial wrapper %d/%d failed: %s",
+                                    index, len(unresolved_records), error)
+                        # A failed or timed-out RPC leaves the session state
+                        # unknown. Discard it, then retry later wrappers in a
+                        # fresh target. A normal in-agent probe timeout is
+                        # returned in stats and safely reuses this process.
+                        probe_controller.terminate_process()
+                        probe_controller = None
+                        probe_image_base = None
+            finally:
+                if probe_controller is not None:
                     probe_controller.terminate_process()
 
     return diagnostics
