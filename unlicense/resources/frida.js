@@ -7,6 +7,8 @@ let allocatedBuffers = [];
 let originalPageProtections = new Map();
 let oepTracingListeners = [];
 let oepReached = false;
+let oepThreadId = null;
+let wrapperTraceState = null;
 
 // DLLs-related
 let skipDllOepInstr32 = null;
@@ -48,6 +50,7 @@ function rangeContainsAddress(range, address) {
 
 function notifyOepFound(dumpedModule, oepCandidate) {
     oepReached = true;
+    oepThreadId = Process.getCurrentThreadId();
     
     // Make OEP ranges readable and writeable during the dumping phase
     setOepRangesProtection('rw-');
@@ -57,7 +60,8 @@ function notifyOepFound(dumpedModule, oepCandidate) {
     let isDotNetInitialized = isDotNetProcess();
     send({ 'event': 'oep_reached', 'OEP': oepCandidate, 'BASE': dumpedModule.base, 'DOTNET': isDotNetInitialized })
     let sync_op = recv('block_on_oep', function (_value) { });
-    // Note: never returns
+    // Normally the process is killed while blocked. Native wrapper tracing
+    // may explicitly release it after installing Stalker.
     sync_op.wait();
 }
 
@@ -114,6 +118,7 @@ function registerExceptionHandler(dumpedModule, expectedOepRanges, moduleIsDll) 
                 log(`OEP found (thread #${threadId}): ${oepCandidate}`);
                 // Report the potential OEP
                 notifyOepFound(dumpedModule, oepCandidate);
+                return true;
             }
 
             // If the access violation is not an execution, "allow" the operation.
@@ -164,6 +169,8 @@ function registerExceptionHandler(dumpedModule, expectedOepRanges, moduleIsDll) 
                 // Report the potential OEP
                 log(`OEP found (thread #${threadId}): ${oepCandidate}`);
                 notifyOepFound(dumpedModule, oepCandidate);
+                expectionHandled = true;
+                return;
             }
         });
 
@@ -323,6 +330,145 @@ rpc.exports = {
     notifyDumpingFinished: function () {
         // Make OEP executable again once dumping is finished
         setOepRangesProtection('rwx');
+    },
+    setupWrapperTrace: function (wrappers, excludedModuleName) {
+        if (oepThreadId === null) {
+            throw new Error('OEP thread is not available for native tracing');
+        }
+
+        const wrappersByAddress = new Map();
+        const returnsByAddress = new Map();
+        wrappers.forEach(wrapper => {
+            const wrapperKey = ptr(wrapper.wrapperAddress).toString();
+            const returnKey = ptr(wrapper.returnAddress).toString();
+            if (!wrappersByAddress.has(wrapperKey)) {
+                wrappersByAddress.set(wrapperKey, []);
+            }
+            wrappersByAddress.get(wrapperKey).push(wrapper);
+            if (!returnsByAddress.has(returnKey)) {
+                returnsByAddress.set(returnKey, []);
+            }
+            returnsByAddress.get(returnKey).push(wrapper);
+        });
+
+        const exportsByAddress = new Map();
+        Process.enumerateModules().forEach(module => {
+            if (module.name.toLowerCase() === excludedModuleName.toLowerCase()) {
+                return;
+            }
+            module.enumerateExports().forEach(exportInfo => {
+                if (exportInfo.type === 'function') {
+                    exportsByAddress.set(exportInfo.address.toString(), {
+                        address: exportInfo.address.toString(),
+                        name: exportInfo.name,
+                        module: module.name
+                    });
+                }
+            });
+        });
+
+        const state = {
+            active: null,
+            resolutions: new Map(),
+            wrappersByAddress: wrappersByAddress,
+            returnsByAddress: returnsByAddress,
+            exportsByAddress: exportsByAddress
+        };
+        wrapperTraceState = state;
+
+        function saveResolution(exportInfo) {
+            if (state.active === null || exportInfo === null) {
+                return;
+            }
+            const result = {
+                callAddress: state.active.callAddress,
+                wrapperAddress: state.active.wrapperAddress,
+                address: exportInfo.address,
+                name: exportInfo.name,
+                module: exportInfo.module
+            };
+            state.resolutions.set(result.callAddress, result);
+            state.active = null;
+        }
+
+        Stalker.follow(oepThreadId, {
+            transform(iterator) {
+                let instruction = iterator.next();
+                if (instruction === null) {
+                    return;
+                }
+
+                const blockAddress = instruction.address.toString();
+                const wrapperCandidates = state.wrappersByAddress.get(blockAddress);
+                const returnCandidates = state.returnsByAddress.get(blockAddress);
+                const exportInfo = state.exportsByAddress.get(blockAddress);
+
+                if (wrapperCandidates !== undefined) {
+                    iterator.putCallout(context => {
+                        let nativeReturn;
+                        try {
+                            nativeReturn = context.sp.readPointer();
+                        }
+                        catch (_error) {
+                            return;
+                        }
+                        const matching = wrapperCandidates.find(candidate =>
+                            ptr(candidate.returnAddress).equals(nativeReturn));
+                        const selected = matching === undefined
+                            ? wrapperCandidates[0]
+                            : matching;
+                        state.active = Object.assign({}, selected, {
+                            nativeReturn: nativeReturn,
+                            lastExport: null
+                        });
+                    });
+                }
+
+                if (exportInfo !== undefined) {
+                    iterator.putCallout(context => {
+                        if (state.active === null) {
+                            return;
+                        }
+                        state.active.lastExport = exportInfo;
+                        try {
+                            if (context.sp.readPointer().equals(state.active.nativeReturn)) {
+                                saveResolution(exportInfo);
+                            }
+                        }
+                        catch (_error) {
+                            // Keep tracing until the known return site is reached.
+                        }
+                    });
+                }
+
+                if (returnCandidates !== undefined) {
+                    iterator.putCallout(_context => {
+                        if (state.active !== null) {
+                            saveResolution(state.active.lastExport);
+                        }
+                    });
+                }
+
+                do {
+                    iterator.keep();
+                } while ((instruction = iterator.next()) !== null);
+            }
+        });
+
+        // The OEP was made non-executable only to detect it. Native tracing
+        // now needs to let the original thread continue normally.
+        setOepRangesProtection('rwx');
+    },
+    collectWrapperTrace: function () {
+        if (wrapperTraceState === null) {
+            return [];
+        }
+        Stalker.unfollow(oepThreadId);
+        Stalker.flush();
+        const results = Array.from(wrapperTraceState.resolutions.values());
+        wrapperTraceState = null;
+        setImmediate(() => Stalker.garbageCollect());
+        return results;
     },
     getArchitecture: function () { return Process.arch; },
     getPointerSize: function () { return Process.pointerSize; },

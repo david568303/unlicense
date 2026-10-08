@@ -2,18 +2,21 @@ import json
 import struct
 import tempfile
 import unittest
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import Mock, patch
 
 from unicorn import (  # type: ignore
     Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_ERR_MAP)
+from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore
 
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
+from unlicense.imports import ImportToCallSiteDict
 from unlicense.process_control import (Architecture, MemoryRange,
                                        ProcessController,
                                        ReadProcessMemoryError)
-from unlicense.winlicense2 import _write_diagnostic_report
+from unlicense.winlicense2 import _resolve_imports, _write_diagnostic_report
 
 
 class FakeProcessController(ProcessController):
@@ -23,6 +26,8 @@ class FakeProcessController(ProcessController):
         super().__init__(1, "fixture.exe", Architecture.X86_32, 4, 0x1000)
         self.pages = pages
         self.exports = exports
+        self.trace_results: Dict[int, int] = {}
+        self.trace_timeout = 0
 
     def find_module_by_address(self, address: int) -> Optional[Dict[str, Any]]:
         return None
@@ -56,6 +61,12 @@ class FakeProcessController(ProcessController):
                                      ) -> Dict[int, Dict[str, Any]]:
         return self.exports
 
+    def trace_wrapped_imports(self, wrappers: List[Dict[str, Any]],
+                              timeout_ms: int) -> Dict[int, int]:
+        del wrappers
+        self.trace_timeout = timeout_ms
+        return self.trace_results
+
     def allocate_process_memory(self, size: int, near: int) -> int:
         raise NotImplementedError
 
@@ -88,6 +99,32 @@ def _relative_branch(opcode: int, instruction_address: int,
 
 
 class HeapWrapperEmulationTests(unittest.TestCase):
+
+    def test_native_trace_result_resolves_exception_wrapper(self) -> None:
+        call_site = 0x401000
+        wrapper = 0x402000
+        target_api = 0x77003000
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, wrapper)
+        pages = {
+            call_site: bytes(call_page),
+            wrapper: bytes([0xcc]) + bytes(0xfff),
+        }
+        exports = {target_api: {"name": "TargetApi"}}
+        controller = FakeProcessController(pages, exports)
+        controller.trace_results = {call_site: target_api}
+        imports: ImportToCallSiteDict = defaultdict(list)
+        disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
+        disassembler.detail = True
+
+        diagnostics = _resolve_imports(imports,
+                                       {(call_site, 5, False, wrapper, None)},
+                                       None, exports, disassembler, controller,
+                                       250)
+
+        self.assertEqual([(call_site, 5, False)], imports[target_api])
+        self.assertEqual("native_trace", diagnostics[0]["resolution_method"])
+        self.assertEqual(250, controller.trace_timeout)
 
     def test_synthetic_heap_search_is_bounded(self) -> None:
         controller = FakeProcessController({}, {})

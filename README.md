@@ -41,6 +41,19 @@ does not contain the complete protected or unpacked executable. Themida 2.x
 heap-based wrappers are emulated without entering the real Windows heap, which
 allows import resolution to continue past calls such as `RtlAllocateHeap`.
 
+Exception-driven wrappers can optionally be resolved by briefly executing the
+target after its OEP under Frida Stalker:
+
+```powershell
+.\unlicense-win7-x86.exe .\protected-x86.exe --verbose=true --timeout=60 `
+  --native_trace_timeout=1500 `
+  --diagnostic_output=unlicense-diagnostics.json
+```
+
+The native fallback is disabled by default because it lets the target execute
+normally for the requested number of milliseconds. Use it only in an isolated
+test system where target-side effects are acceptable.
+
 Unlicense is not a remote dumper: Frida starts the target locally and Scylla
 opens that local process ID.  Consequently, running Unlicense on Windows 10/11
 while the target runs in a Windows 7 VM will not work without replacing the
@@ -122,6 +135,9 @@ FLAGS
     --diagnostic_output=DIAGNOSTIC_OUTPUT
         Type: Optional[Optional]
         Default: None
+    --native_trace_timeout=NATIVE_TRACE_TIMEOUT
+        Type: int
+        Default: 0
 
 NOTES
     You can also use flags syntax for POSITIONAL ARGUMENTS

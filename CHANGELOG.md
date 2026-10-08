@@ -6,6 +6,7 @@
 - Add a reproducible CPython 3.8 build path for Windows 7 legacy targets.
 - Add compact Themida 2.x wrapper diagnostics and in-memory PE candidate
   reporting.
+- Add an opt-in native Frida Stalker fallback for exception-driven wrappers.
 
 ### Fixed
 - Simulate Windows heap APIs while resolving import wrappers instead of

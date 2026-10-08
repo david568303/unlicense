@@ -1,5 +1,6 @@
 import functools
 import logging
+import time
 from importlib import resources
 from pathlib import Path
 from typing import (List, Callable, Dict, Any, Optional)
@@ -38,6 +39,7 @@ class FridaProcessController(ProcessController):
 
         # Initialize FridaProcessController specifics
         self._frida_rpc = frida_rpc
+        self._frida_script = frida_script
         self._frida_session = frida_session
         self._exported_functions_cache: Optional[Dict[int, Dict[str,
                                                                 Any]]] = None
@@ -74,6 +76,17 @@ class FridaProcessController(ProcessController):
     def enumerate_pe_candidates(self) -> List[Dict[str, Any]]:
         value: List[Dict[str, Any]] = self._frida_rpc.enumerate_pe_candidates()
         return value
+
+    def trace_wrapped_imports(self, wrappers: List[Dict[str, Any]],
+                              timeout_ms: int) -> Dict[int, int]:
+        self._frida_rpc.setup_wrapper_trace(wrappers, self.main_module_name)
+        self._frida_script.post({"type": "block_on_oep"})
+        time.sleep(max(0, timeout_ms) / 1000.0)
+        value: List[Dict[str, Any]] = self._frida_rpc.collect_wrapper_trace()
+        return {
+            int(result["callAddress"], 16): int(result["address"], 16)
+            for result in value
+        }
 
     def enumerate_module_ranges(
             self,
