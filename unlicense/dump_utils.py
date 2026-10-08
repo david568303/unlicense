@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import struct
 from tempfile import TemporaryDirectory
@@ -18,6 +19,21 @@ from .process_control import MemoryRange, ProcessController
 LOG = logging.getLogger(__name__)
 
 SectionFileMapping = Tuple[int, int, int, int]
+
+# Themida 2.x emits this position-independent integrity guard in one of its
+# executable runtime sections.  The guard reads a pointer from a private,
+# process-only allocation and returns 0 when no state/mismatch is present or 1
+# when tampering is detected.  A standalone PE cannot serialize that private
+# allocation, so the captured pointer becomes stale on the next launch.  The
+# full control-flow signature is deliberately strict; only the success return
+# at the function entry is patched.
+_VM_POINTER_GUARD_PATTERN = re.compile(
+    b"\x60\xe8\x00\x00\x00\x00\x5a\x81\xea.{4}"
+    b"\x8b\xb2.{4}\x85\xf6\x0f\x85\x07\x00\x00\x00"
+    b"\x61\xb8\x00\x00\x00\x00\xc3\x8b\x06\x39\x82.{4}"
+    b"\x0f\x85\x0b\x00\x00\x00\x61\xb8\x00\x00\x00\x00"
+    b"\xe9\x06\x00\x00\x00\x61\xb8\x01\x00\x00\x00\xc3",
+    re.DOTALL)
 
 
 def _materialize_iat_input(process_controller: ProcessController,
@@ -96,6 +112,52 @@ def _overlay_pristine_data(
         "restored_bytes": restored_bytes,
         "preserved_rebuilt_regions": len(preserved_patches),
     }
+
+
+def _patch_stale_vm_pointer_guards(
+        file_data: bytearray,
+        executable_mappings: List[SectionFileMapping]) -> List[int]:
+    """Return RVAs of exact Themida private-state guards made inert."""
+    patched_rvas: List[int] = []
+    for section_rva, _virtual_size, raw_offset, raw_size in executable_mappings:
+        section_data = bytes(file_data[raw_offset:raw_offset + raw_size])
+        for match in _VM_POINTER_GUARD_PATTERN.finditer(section_data):
+            file_offset = raw_offset + match.start()
+            # xor eax, eax; ret -- the guard's documented success path.
+            file_data[file_offset:file_offset + 3] = b"\x31\xc0\xc3"
+            patched_rvas.append(section_rva + match.start())
+    return patched_rvas
+
+
+def _neutralize_stale_vm_pointer_guards(dumped_path: str) -> List[int]:
+    binary = lief.PE.parse(dumped_path)
+    if binary is None:
+        return []
+    executable_mappings: List[SectionFileMapping] = [
+        (int(section.virtual_address), int(section.virtual_size),
+         int(section.offset), int(section.size))
+        for section in lief_pe_sections(binary)
+        if section.has_characteristic(
+            lief.PE.SECTION_CHARACTERISTICS.MEM_EXECUTE)
+    ]
+    del binary
+
+    try:
+        with open(dumped_path, "rb") as dumped_file:
+            file_data = bytearray(dumped_file.read())
+        patched_rvas = _patch_stale_vm_pointer_guards(
+            file_data, executable_mappings)
+        if patched_rvas:
+            with open(dumped_path, "wb") as dumped_file:
+                dumped_file.write(file_data)
+            LOG.info("Neutralized %d stale Themida private-state guard(s) at "
+                     "RVA(s): %s", len(patched_rvas),
+                     ", ".join(hex(rva) for rva in patched_rvas))
+        return patched_rvas
+    except OSError as error:
+        LOG.warning("Failed to neutralize stale Themida state guards: %s",
+                    error)
+        return []
 
 
 def _restore_pristine_ranges_in_dump(
@@ -238,6 +300,7 @@ def dump_pe(
         "restored_bytes": 0,
         "preserved_rebuilt_regions": 0,
     }
+    neutralized_vm_state_guards: List[int] = []
     if effective_iat_size == 0:
         iat_strategy = "preserved_dump"
         LOG.warning(
@@ -277,6 +340,8 @@ def dump_pe(
             runtime_state_restoration = _restore_pristine_ranges_in_dump(
                 TMP_FILE_PATH2, image_base, pristine_ranges,
                 preserved_patch_ranges or [])
+        neutralized_vm_state_guards = _neutralize_stale_vm_pointer_guards(
+            TMP_FILE_PATH2)
 
         # All remaining operations are file-only.  Keeping a heavily packed
         # GUI target alive while Scylla and LIEF rebuild the dump wastes CPU,
@@ -309,6 +374,9 @@ def dump_pe(
         validation["runtime_iat_address"] = hex(effective_iat_addr)
         validation["runtime_iat_size"] = effective_iat_size
         validation["runtime_state_restoration"] = runtime_state_restoration
+        validation["neutralized_vm_state_guards"] = [
+            hex(rva) for rva in neutralized_vm_state_guards
+        ]
         validation_path = f"{output_file_name}.validation.json"
         try:
             with open(validation_path, "w", encoding="utf-8") as report_file:

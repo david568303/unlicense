@@ -22,6 +22,11 @@
   `.text` section that the original outside-section heuristic cannot see.
 
 ### Fixed
+- Detect the exact Themida 2.x private-state integrity guard that dereferences a
+  process-only allocation after restart and replace its entry with the guard's
+  normal success result. This avoids an access violation in the protector
+  runtime without using target-specific addresses or modifying application
+  code.
 - Preserve a clean snapshot of every PE section at the blocked OEP when native
   tracing is enabled. After import reconstruction, restore that snapshot in
   the output while retaining the rebuilt IAT call sites. This prevents late

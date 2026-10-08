@@ -17,7 +17,8 @@ from unlicense.application import (_create_primary_process,
                                    _create_probe_process, _normalize_cli_bool,
                                    _wait_for_event_with_progress)
 from unlicense.dump_utils import (dump_pe, _materialize_iat_input,
-                                  _overlay_pristine_data, _resize_pe)
+                                  _overlay_pristine_data,
+                                  _patch_stale_vm_pointer_guards, _resize_pe)
 from unlicense.emulation import resolve_wrapped_api, _allocate_emulated_heap
 from unlicense.frida_exec import (FridaProcessController, _call_with_timeout,
                                   _wrapper_trace_collection_timeout)
@@ -404,6 +405,22 @@ class HeapWrapperEmulationTests(unittest.TestCase):
             "restored_bytes": 0x100,
             "preserved_rebuilt_regions": 1,
         }, result)
+
+    def test_exact_themida_private_state_guard_returns_success(self) -> None:
+        guard = bytes.fromhex(
+            "60e8000000005a81eaecb47c0b8bb26b0b7c0b85f6"
+            "0f850700000061b800000000c38b063982c20d7c0b"
+            "0f850b00000061b800000000e90600000061b801000000c3")
+        file_data = bytearray(b"H" * 0x200 + b"X" * 0x100)
+        file_data[0x220:0x220 + len(guard)] = guard
+
+        patched = _patch_stale_vm_pointer_guards(
+            file_data, [(0xb41000, 0x100, 0x200, 0x100)])
+
+        self.assertEqual([0xb41020], patched)
+        self.assertEqual(bytes.fromhex("31c0c3"), file_data[0x220:0x223])
+        self.assertEqual(guard[3:],
+                         file_data[0x223:0x220 + len(guard)])
 
     def test_native_trace_result_resolves_exception_wrapper(self) -> None:
         call_site = 0x401000
