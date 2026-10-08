@@ -120,6 +120,69 @@ class HeapWrapperEmulationTests(unittest.TestCase):
         self.assertIsNone(resolved)
         self.assertIn("stopped before reaching", diagnostic["error"])
 
+    def test_int3_wrapper_stops_with_diagnostic(self) -> None:
+        call_site = 0x401000
+        interrupt_page = bytes([0xcc]) + bytes(0xfff)
+        controller = FakeProcessController({call_site: interrupt_page}, {})
+        diagnostic: Dict[str, Any] = {}
+
+        resolved = resolve_wrapped_api(call_site, controller, None, diagnostic)
+
+        self.assertIsNone(resolved)
+        self.assertEqual(3, diagnostic["interrupt"]["number"])
+        self.assertIn("requires native handling", diagnostic["error"])
+
+    def test_cleanup_apis_are_simulated_before_target_api(self) -> None:
+        call_site = 0x401000
+        wrapper = 0x402000
+        free_unicode_string = 0x77001000
+        delete_boundary_descriptor = 0x77002000
+        target_api = 0x77003000
+
+        call_page = bytearray(0x1000)
+        call_page[0:5] = _relative_branch(0xe8, call_site, wrapper)
+
+        wrapper_page = bytearray(0x1000)
+        wrapper_code = bytearray(b"\x6a\x00")
+        free_call = wrapper + len(wrapper_code)
+        wrapper_code += _relative_branch(0xe8, free_call, free_unicode_string)
+        wrapper_code += b"\x6a\x00"
+        delete_call = wrapper + len(wrapper_code)
+        wrapper_code += _relative_branch(0xe8, delete_call,
+                                         delete_boundary_descriptor)
+        target_jump = wrapper + len(wrapper_code)
+        wrapper_code += _relative_branch(0xe9, target_jump, target_api)
+        wrapper_page[0:len(wrapper_code)] = wrapper_code
+
+        pages = {
+            call_site: bytes(call_page),
+            wrapper: bytes(wrapper_page),
+            free_unicode_string: bytes([0xc3]) + bytes(0xfff),
+            delete_boundary_descriptor: bytes([0xc3]) + bytes(0xfff),
+            target_api: bytes([0xc3]) + bytes(0xfff),
+        }
+        exports = {
+            free_unicode_string: {
+                "name": "RtlFreeUnicodeString",
+            },
+            delete_boundary_descriptor: {
+                "name": "RtlDeleteBoundaryDescriptor",
+            },
+            target_api: {
+                "name": "TargetApi",
+            },
+        }
+        diagnostic: Dict[str, Any] = {}
+
+        resolved = resolve_wrapped_api(call_site,
+                                       FakeProcessController(pages, exports),
+                                       call_site + 5, diagnostic)
+
+        self.assertEqual(target_api, resolved)
+        self.assertEqual(
+            ["RtlFreeUnicodeString", "RtlDeleteBoundaryDescriptor"],
+            [api["name"] for api in diagnostic["simulated_apis"]])
+
     def test_rtl_allocate_heap_is_simulated_before_target_api(self) -> None:
         call_site = 0x401000
         wrapper = 0x402000

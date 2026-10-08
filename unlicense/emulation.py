@@ -4,7 +4,8 @@ from typing import Dict, Tuple, Any, Optional
 
 from unicorn import (  # type: ignore
     Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_PROT_READ,
-    UC_PROT_WRITE, UC_PROT_ALL, UC_HOOK_MEM_UNMAPPED, UC_HOOK_BLOCK)
+    UC_PROT_WRITE, UC_PROT_ALL, UC_HOOK_MEM_UNMAPPED, UC_HOOK_BLOCK,
+    UC_HOOK_INTR)
 from unicorn.x86_const import (  # type: ignore
     UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_EIP, UC_X86_REG_RSP,
     UC_X86_REG_RBP, UC_X86_REG_RIP, UC_X86_REG_MSR, UC_X86_REG_EAX,
@@ -99,6 +100,9 @@ def resolve_wrapped_api(
         uc.hook_add(UC_HOOK_BLOCK,
                     _unicorn_hook_block,
                     user_data=emulation_context)
+        uc.hook_add(UC_HOOK_INTR,
+                    _unicorn_hook_interrupt,
+                    user_data=emulation_context)
 
         uc.emu_start(wrapper_start_addr,
                      wrapper_start_addr + 1024,
@@ -109,10 +113,9 @@ def resolve_wrapped_api(
         if resolved_address is None:
             pc = uc.reg_read(pc_register)
             assert isinstance(pc, int)
-            diagnostic.update({
-                "error": "Emulation stopped before reaching a final API",
-                "pc": hex(pc),
-            })
+            diagnostic.setdefault(
+                "error", "Emulation stopped before reaching a final API")
+            diagnostic["pc"] = hex(pc)
             LOG.debug("Emulation limit reached before resolving the wrapper")
             return None
 
@@ -279,6 +282,31 @@ def _unicorn_hook_block(uc: Uc, address: int, _size: int,
             return
 
 
+def _unicorn_hook_interrupt(uc: Uc, interrupt_number: int,
+                            emulation_context: Dict[str, Any]) -> None:
+    process_controller: ProcessController = emulation_context[
+        "process_controller"]
+    if process_controller.architecture == Architecture.X86_32:
+        pc_register = UC_X86_REG_EIP
+    else:
+        pc_register = UC_X86_REG_RIP
+    pc = uc.reg_read(pc_register)
+    assert isinstance(pc, int)
+    instruction_address = pc - 1 if interrupt_number == 3 else pc
+    diagnostic: Dict[str, Any] = emulation_context["diagnostic"]
+    diagnostic.update({
+        "error": f"CPU interrupt {interrupt_number} requires native handling",
+        "interrupt": {
+            "number": interrupt_number,
+            "instruction_address": hex(instruction_address),
+            "next_pc": hex(pc),
+        },
+    })
+    LOG.debug("Stopping at CPU interrupt %d at %s", interrupt_number,
+              hex(instruction_address))
+    uc.emu_stop()
+
+
 def _is_no_return_api(api_name: str) -> bool:
     NO_RETURN_APIS = ["ExitProcess", "FatalExit", "ExitThread"]
     return api_name in NO_RETURN_APIS
@@ -288,7 +316,8 @@ def _is_simulated_api(api_name: str) -> bool:
     simulated_apis = [
         "Sleep", "GetProcessHeap", "RtlGetProcessHeap", "HeapAlloc",
         "RtlAllocateHeap", "HeapFree", "RtlFreeHeap", "HeapReAlloc",
-        "RtlReAllocateHeap", "HeapSize", "RtlSizeHeap"
+        "RtlReAllocateHeap", "HeapSize", "RtlSizeHeap", "RtlFreeUnicodeString",
+        "RtlFreeAnsiString", "RtlFreeOemString", "RtlDeleteBoundaryDescriptor"
     ]
     return api_name in simulated_apis
 
@@ -349,6 +378,28 @@ def _simulate_api(
             "result": result,
         })
         return result, 3, details
+
+    if api_name in [
+            "RtlFreeUnicodeString", "RtlFreeAnsiString", "RtlFreeOemString"
+    ]:
+        descriptor = _read_api_argument(uc, sp, arch, 0)
+        details["descriptor"] = hex(descriptor)
+        details["descriptor_reset"] = False
+        if descriptor != 0:
+            descriptor_size = 8 if arch == Architecture.X86_32 else 16
+            try:
+                uc.mem_write(descriptor, bytes(descriptor_size))
+                details["descriptor_reset"] = True
+            except UcError:
+                # Avoid a nested Frida RPC from the Unicorn callback. The
+                # descriptor is only reset when its page was already mapped.
+                pass
+        return 0, 1, details
+
+    if api_name == "RtlDeleteBoundaryDescriptor":
+        descriptor = _read_api_argument(uc, sp, arch, 0)
+        details["descriptor"] = hex(descriptor)
+        return 0, 1, details
 
     raise NotImplementedError(f"No simulator for API '{api_name}'")
 

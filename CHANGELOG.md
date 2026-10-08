@@ -12,6 +12,8 @@
   executing the real heap implementation with an incomplete emulated PEB.
 - Bound wrapper emulation and keep synthetic heap allocation local to Unicorn
   so a paused target cannot stall a nested Frida RPC indefinitely.
+- Simulate RTL string and boundary-descriptor cleanup calls used as wrapper
+  noise, and report INT3-based wrappers without treating them as resolved.
 - Avoid printing raw ANSI color sequences in the Windows 7 console.
 
 ## [0.4.0] - 2023-08-14
